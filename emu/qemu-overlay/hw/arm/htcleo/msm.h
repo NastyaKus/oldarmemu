@@ -92,6 +92,12 @@
 #define TYPE_MSM_STUB   "msm-stub"
 #define TYPE_MSM_GPIO   "msm-gpio"
 #define TYPE_MSM_SIRC   "msm-sirc"
+#define TYPE_MSM_DMOV   "msm-dmov"
+#define TYPE_MSM_NAND   "msm-nand"
+#define TYPE_MSM_I2C    "msm-i2c"
+#define TYPE_LEO_TOUCH  "leo-touch"
+#define TYPE_HTC_MICROP "htc-microp"
+#define TYPE_I2C_REGFILE "i2c-regfile"
 
 /* Create a logging, memory-like placeholder for unmodelled hardware. */
 DeviceState *msm_stub_create(const char *name, hwaddr base, uint64_t size,

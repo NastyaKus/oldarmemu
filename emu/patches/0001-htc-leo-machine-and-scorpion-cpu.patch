@@ -11,6 +11,23 @@ index 2aa4b5d..0f2e6e7 100644
 +    bool
 +    default y
 +    depends on TCG && ARM
+diff --git a/hw/arm/boot.c b/hw/arm/boot.c
+index d391cd0..f1917b1 100644
+--- a/hw/arm/boot.c
++++ b/hw/arm/boot.c
+@@ -325,8 +325,10 @@ static void set_kernel_args(const struct arm_boot_info *info, AddressSpace *as)
+         uint8_t atag_board_buf[0x1000];
+ 
+         atag_board_len = (info->atag_board(info, atag_board_buf) + 3) & ~3;
+-        WRITE_WORD(p, (atag_board_len + 8) >> 2);
+-        WRITE_WORD(p, 0x414f4d50);
++        if (!info->atag_board_raw) {
++            WRITE_WORD(p, (atag_board_len + 8) >> 2);
++            WRITE_WORD(p, 0x414f4d50);
++        }
+         address_space_write(as, p, MEMTXATTRS_UNSPECIFIED,
+                             atag_board_buf, atag_board_len);
+         p += atag_board_len;
 diff --git a/hw/arm/meson.build b/hw/arm/meson.build
 index dc68391..851132a 100644
 --- a/hw/arm/meson.build
@@ -24,6 +41,19 @@ index dc68391..851132a 100644
  arm_common_ss.add(files('boot.c'))
  
  hw_arch += {'arm': arm_ss}
+diff --git a/include/hw/arm/boot.h b/include/hw/arm/boot.h
+index a2e22bd..351d2df 100644
+--- a/include/hw/arm/boot.h
++++ b/include/hw/arm/boot.h
+@@ -65,6 +65,8 @@ struct arm_boot_info {
+      */
+     bool secure_boot;
+     int (*atag_board)(const struct arm_boot_info *info, void *p);
++    /* atag_board() emits complete tags itself (no ATAG_BOARD wrapper) */
++    bool atag_board_raw;
+     /* multicore boards that use the default secondary core boot functions
+      * can ignore these two function calls. If the default functions won't
+      * work, then write_secondary_boot() should write a suitable blob of
 diff --git a/target/arm/tcg/cpu32.c b/target/arm/tcg/cpu32.c
 index a2a23ea..1b1e1a1 100644
 --- a/target/arm/tcg/cpu32.c

@@ -12,11 +12,16 @@
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "qemu/timer.h"
+#include "qapi/visitor.h"
+#include "qemu/cutils.h"
 #include "hw/boards.h"
 #include "hw/arm/boot.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
+#include "hw/i2c/i2c.h"
+#include "system/blockdev.h"
+#include "hw/qdev-properties-system.h"
 #include "chardev/char-fe.h"
 #include "system/system.h"
 #include "system/reset.h"
@@ -41,6 +46,11 @@ struct HtcLeoMachineState {
     DeviceState *a9;
     DeviceState *sirc;
     DeviceState *gpio;
+    DeviceState *dmov;
+    DeviceState *nand;
+    uint32_t nand_mb;
+    uint32_t system_mb;
+    uint32_t cache_mb;
 
     /* ram_console tap */
     QEMUTimer *rc_timer;
@@ -54,6 +64,73 @@ struct HtcLeoMachineState {
 OBJECT_DECLARE_SIMPLE_TYPE(HtcLeoMachineState, HTC_LEO_MACHINE)
 
 static struct arm_boot_info leo_binfo;
+
+/*
+ * NAND partition layout, as cLK builds it (lk/target/htcleo/init.c):
+ * apps partitions start at block 0x219; userdata takes what is left up
+ * to (blocks - 1 - 186 - 4).  Lengths are in MiB, 128 KiB per block.
+ */
+#define LEO_FLASH_OFFSET        0x219
+#define LEO_BLOCKS_PER_MB       8
+
+typedef struct LeoPartition {
+    const char *name;
+    uint32_t start;     /* in blocks */
+    uint32_t length;    /* in blocks */
+} LeoPartition;
+
+static int leo_build_ptable(HtcLeoMachineState *s, LeoPartition *p)
+{
+    uint32_t nblocks = (s->nand_mb ? s->nand_mb : 512) * LEO_BLOCKS_PER_MB;
+    uint32_t sys_mb = s->system_mb ? s->system_mb : 150;
+    uint32_t cache_mb = s->cache_mb ? s->cache_mb : 44;
+    uint32_t start = LEO_FLASH_OFFSET;
+    uint32_t end = nblocks - 1 - 186 - 4;
+    const struct { const char *name; uint32_t mb; } def[] = {
+        { "misc", 1 }, { "recovery", 5 }, { "boot", 5 },
+        { "system", sys_mb }, { "cache", cache_mb }, { "userdata", 0 },
+    };
+    int n = 0;
+
+    for (int i = 0; i < ARRAY_SIZE(def); i++) {
+        uint32_t len = def[i].mb ? def[i].mb * LEO_BLOCKS_PER_MB : end - start;
+        if (start + len > end) {
+            error_report("htc-leo: partitions do not fit in %u MiB NAND",
+                         nblocks / LEO_BLOCKS_PER_MB);
+            exit(EXIT_FAILURE);
+        }
+        p[n].name = def[i].name;
+        p[n].start = start;
+        p[n].length = len;
+        start += len;
+        n++;
+    }
+    return n;
+}
+
+#define ATAG_MSM_PARTITION      0x4d534d70
+
+static int leo_atag_board(const struct arm_boot_info *info, void *p)
+{
+    HtcLeoMachineState *s = HTC_LEO_MACHINE(qdev_get_machine());
+    LeoPartition parts[8];
+    int n = leo_build_ptable(s, parts);
+    uint32_t *w = p;
+
+    w[0] = cpu_to_le32(2 + n * 7);
+    w[1] = cpu_to_le32(ATAG_MSM_PARTITION);
+    w += 2;
+    for (int i = 0; i < n; i++) {
+        char name[16] = { 0 };
+        pstrcpy(name, sizeof(name), parts[i].name);
+        memcpy(w, name, 16);
+        w[4] = cpu_to_le32(parts[i].start);
+        w[5] = cpu_to_le32(parts[i].length);
+        w[6] = 0;
+        w += 7;
+    }
+    return (2 + n * 7) * 4;
+}
 
 /*
  * The HD2 has no accessible UART; kernels log into the Android
@@ -151,15 +228,12 @@ static void leo_map_stubs(void)
         { "sdc3",      MSM_SDC3_PHYS,      0x1000 },
         { "sdc4",      MSM_SDC4_PHYS,      0x1000 },
         { "hsusb",     MSM_HSUSB_PHYS,     0x1000 },
-        { "nand",      MSM_NAND_PHYS,      0x1000 },
         { "ssbi",      MSM_SSBI_PHYS,      0x1000 },
         { "clk_ctl",   MSM_CLK_CTL_PHYS,   0x1000 },
         { "tcsr",      MSM_TCSR_PHYS,      0x1000 },
         { "scpll",     MSM_SCPLL_PHYS,     0x1000 },
         { "gpiocfg1",  MSM_GPIOCFG1_PHYS,  0x1000 },
         { "gpiocfg2",  MSM_GPIOCFG2_PHYS,  0x1000 },
-        { "dmov",      MSM_DMOV_PHYS,      0x1000 },
-        { "i2c",       MSM_I2C_PHYS,       0x1000 },
         { "uart1",     MSM_UART1_PHYS,     0x1000 },
         { "uart2",     MSM_UART2_PHYS,     0x1000 },
         { "uart3",     MSM_UART3_PHYS,     0x1000 },
@@ -202,12 +276,27 @@ static void leo_map_stubs(void)
 #define LEO_GPIO_TP_INT_N       92
 #define LEO_GPIO_POWER_KEY      94
 #define LEO_GPIO_SD_STATUS      153
+#define LEO_GPIO_HDS_MIC        35
+#define LEO_GPIO_UP_INT_N       90
+#define LEO_GPIO_TS_POWER       160
+#define LEO_GPIO_COMPASS_INT_N  39
+#define LEO_GPIO_HDS_DET        145
+#define LEO_GPIO_KP_MPIN0       42
+#define LEO_GPIO_KP_MPIN1       41
+#define LEO_GPIO_KP_MPIN2       40
 
 /* idle levels of input pins as set by board pull-ups */
 static void leo_gpio_defaults(DeviceState *gpio)
 {
     msm_gpio_set_default(gpio, LEO_GPIO_POWER_KEY, 1);   /* active low */
     msm_gpio_set_default(gpio, LEO_GPIO_SD_STATUS, 1);   /* no card */
+    msm_gpio_set_default(gpio, LEO_GPIO_HDS_MIC, 1);     /* no headset mic */
+    msm_gpio_set_default(gpio, LEO_GPIO_HDS_DET, 1);     /* no headset */
+    msm_gpio_set_default(gpio, LEO_GPIO_UP_INT_N, 1);    /* microp idle */
+    msm_gpio_set_default(gpio, LEO_GPIO_TP_INT_N, 1);    /* touch idle */
+    msm_gpio_set_default(gpio, LEO_GPIO_KP_MPIN0, 1);    /* keypad matrix */
+    msm_gpio_set_default(gpio, LEO_GPIO_KP_MPIN1, 1);    /* inputs pulled */
+    msm_gpio_set_default(gpio, LEO_GPIO_KP_MPIN2, 1);    /* up */
 }
 
 static void htc_leo_init(MachineState *machine)
@@ -280,6 +369,50 @@ static void htc_leo_init(MachineState *machine)
     sysbus_connect_irq(SYS_BUS_DEVICE(s->gpio), 1,
                        qdev_get_gpio_in(s->sirc, SIRC_INT_GPIO_GROUP2));
 
+    /* data mover (DMA) */
+    s->dmov = qdev_new(TYPE_MSM_DMOV);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->dmov), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->dmov), 0, MSM_DMOV_PHYS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->dmov), 0,
+                       qdev_get_gpio_in(s->vic, INT_ADM_AARM));
+
+    /* NAND flash: -drive if=mtd,format=raw,file=nand.img */
+    s->nand = qdev_new(TYPE_MSM_NAND);
+    {
+        DriveInfo *dinfo = drive_get(IF_MTD, 0, 0);
+        if (dinfo) {
+            qdev_prop_set_drive_err(s->nand, "drive",
+                                    blk_by_legacy_dinfo(dinfo), &error_fatal);
+        }
+    }
+    qdev_prop_set_uint32(s->nand, "size-mb", s->nand_mb ? s->nand_mb : 512);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->nand), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->nand), 0, MSM_NAND_PHYS);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->nand), 0,
+                       qdev_get_gpio_in(s->vic, INT_NAND_OP_DONE));
+
+    /* I2C bus 0 and the devices on it (board-htcleo.c base_i2c_devices) */
+    {
+        DeviceState *i2c = qdev_new(TYPE_MSM_I2C);
+        I2CBus *bus;
+        I2CSlave *ts;
+
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(i2c), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(i2c), 0, MSM_I2C_PHYS);
+        sysbus_connect_irq(SYS_BUS_DEVICE(i2c), 0,
+                           qdev_get_gpio_in(s->vic, INT_PWB_I2C));
+        bus = I2C_BUS(qdev_get_child_bus(i2c, "i2c"));
+
+        ts = i2c_slave_create_simple(bus, TYPE_LEO_TOUCH, 0x2A >> 1);
+        qdev_connect_gpio_out_named(DEVICE(ts), "irq-n", 0,
+                                    qdev_get_gpio_in(s->gpio, LEO_GPIO_TP_INT_N));
+        qdev_connect_gpio_out_named(s->gpio, "out", LEO_GPIO_TS_POWER,
+                                    qdev_get_gpio_in_named(DEVICE(ts), "power", 0));
+        i2c_slave_create_simple(bus, TYPE_HTC_MICROP, 0xCC >> 1);
+        i2c_slave_create_simple(bus, TYPE_I2C_REGFILE, 0x48);   /* tps65023 */
+        i2c_slave_create_simple(bus, TYPE_I2C_REGFILE, 0x1C);   /* akm8973 */
+    }
+
     leo_map_stubs();
 
     /* ram_console mirror */
@@ -302,12 +435,62 @@ static void htc_leo_init(MachineState *machine)
     leo_binfo.loader_start = LEO_KERNEL_BASE;
     leo_binfo.ram_size = machine->ram_size - (LEO_KERNEL_BASE - MSM_EBI1_BASE);
     leo_binfo.board_id = HTCLEO_MACH_ID;
+    leo_binfo.atag_board = leo_atag_board;
+    leo_binfo.atag_board_raw = true;
     arm_load_kernel(s->cpu, machine, &leo_binfo);
+}
+
+static void leo_get_nand_size(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    HtcLeoMachineState *s = HTC_LEO_MACHINE(obj);
+    uint32_t val = s->nand_mb ? s->nand_mb : 512;
+    visit_type_uint32(v, name, &val, errp);
+}
+
+static void leo_set_nand_size(Object *obj, Visitor *v, const char *name,
+                              void *opaque, Error **errp)
+{
+    HtcLeoMachineState *s = HTC_LEO_MACHINE(obj);
+    uint32_t val;
+    if (visit_type_uint32(v, name, &val, errp)) {
+        s->nand_mb = val;
+    }
+}
+
+static void leo_prop_get_u32(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t *field = (uint32_t *)((char *)obj + (uintptr_t)opaque);
+    visit_type_uint32(v, name, field, errp);
+}
+
+static void leo_prop_set_u32(Object *obj, Visitor *v, const char *name,
+                             void *opaque, Error **errp)
+{
+    uint32_t *field = (uint32_t *)((char *)obj + (uintptr_t)opaque);
+    visit_type_uint32(v, name, field, errp);
 }
 
 static void htc_leo_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add(oc, "system-size", "uint32", leo_prop_get_u32,
+                              leo_prop_set_u32, NULL,
+                              (void *)offsetof(HtcLeoMachineState, system_mb));
+    object_class_property_set_description(oc, "system-size",
+        "system partition size in MiB (cLK default 150)");
+    object_class_property_add(oc, "cache-size", "uint32", leo_prop_get_u32,
+                              leo_prop_set_u32, NULL,
+                              (void *)offsetof(HtcLeoMachineState, cache_mb));
+    object_class_property_set_description(oc, "cache-size",
+        "cache partition size in MiB (cLK default 44)");
+
+    object_class_property_add(oc, "nand-size", "uint32", leo_get_nand_size,
+                              leo_set_nand_size, NULL, NULL);
+    object_class_property_set_description(oc, "nand-size",
+        "NAND size in MiB: 512 (EU HD2) or 1024 (T-Mobile US HD2)");
     static const char * const valid_cpu_types[] = {
         ARM_CPU_TYPE_NAME("scorpion"),
         ARM_CPU_TYPE_NAME("cortex-a8"),
