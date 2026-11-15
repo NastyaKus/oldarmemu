@@ -7,7 +7,7 @@ BUILD="$QEMU_SRC/build"
 if [ ! -f "$BUILD/build.ninja" ]; then
     mkdir -p "$BUILD" && cd "$BUILD"
     ../configure --target-list=arm-softmmu --disable-docs --disable-werror \
-        --disable-kvm --disable-xen --disable-vnc --disable-sdl --disable-gtk \
+        --disable-kvm --disable-xen --disable-sdl --disable-gtk \
         --disable-opengl --disable-tools --disable-guest-agent \
         --enable-debug-info
 fi
