@@ -21,4 +21,12 @@ bool leo_use_kernel_initrd(MachineState *m, const uint8_t *kernel,
 
 void leo_cleanup_tmp(MachineState *m);
 
+/*
+ * Load the kernel from a NAND partition (in erase blocks): a raw Android
+ * boot image, or a yaffs2 file system with zImage and initrd.gz.
+ */
+bool leo_boot_from_nand(MachineState *m, DeviceState *nand,
+                        uint32_t start_block, uint32_t nblocks,
+                        const char *what, Error **errp);
+
 #endif

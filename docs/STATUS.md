@@ -14,7 +14,7 @@
 | SDCC (microSD, PIO + data mover box mode) | done |
 | Hardware buttons (keypad matrix + power) | done |
 | Android boot.img as -kernel (HLE cLK) | done |
-| cLK boot from NAND | todo |
+| Boot from NAND (raw boot.img or yaffs2 zImage+initrd.gz) | done |
 | Android app | todo |
 
 Reference kernel: tytung htcleo 2.6.32 completes all driver init in ~2 s and
@@ -22,3 +22,4 @@ stops at mounting the root fs (no ROM attached yet).
 
 Verified: unmodified CWM 5.0.2.6 for leo (recovery_leo.img) boots to its menu.
 Verified: CWM installs NexusHD2-Gingerbread V3.2a from the emulated SD card into NAND.
+Verified: NexusHD2 GB kernel boots from emulated NAND, Android init starts; stops at q6audio (needs SMD/DAL DSP emulation).

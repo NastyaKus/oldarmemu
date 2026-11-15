@@ -54,6 +54,7 @@ struct HtcLeoMachineState {
     uint32_t nand_mb;
     uint32_t system_mb;
     uint32_t cache_mb;
+    char *boot_mode;
 
     /* keypad matrix (3 driven columns x 3 sensed rows) + power key */
     uint32_t keys_down;         /* bit = col * 3 + row; bit 9 = power */
@@ -578,9 +579,17 @@ static void htc_leo_init(MachineState *machine)
     qemu_register_reset(leo_bootstate_reset, s);
 
     if (!machine->kernel_filename) {
-        error_report("htc-leo: -kernel is required for now "
-                     "(bootloader/NAND boot is not implemented yet)");
-        exit(EXIT_FAILURE);
+        /* like cLK: boot (or recovery) partition from NAND */
+        LeoPartition parts[8];
+        int n = leo_build_ptable(s, parts);
+        const char *want = s->boot_mode && !strcmp(s->boot_mode, "recovery")
+                           ? "recovery" : "boot";
+        for (int i = 0; i < n; i++) {
+            if (!strcmp(parts[i].name, want)) {
+                leo_boot_from_nand(machine, s->nand, parts[i].start,
+                                   parts[i].length, want, &error_fatal);
+            }
+        }
     }
 
     /* -kernel may be an Android boot image (boot.img / recovery.img) */
@@ -636,10 +645,31 @@ static void leo_prop_set_u32(Object *obj, Visitor *v, const char *name,
     visit_type_uint32(v, name, field, errp);
 }
 
+static char *leo_get_boot_mode(Object *obj, Error **errp)
+{
+    return g_strdup(HTC_LEO_MACHINE(obj)->boot_mode ?: "boot");
+}
+
+static void leo_set_boot_mode(Object *obj, const char *v, Error **errp)
+{
+    HtcLeoMachineState *s = HTC_LEO_MACHINE(obj);
+    if (strcmp(v, "boot") && strcmp(v, "recovery")) {
+        error_setg(errp, "boot-mode must be 'boot' or 'recovery'");
+        return;
+    }
+    g_free(s->boot_mode);
+    s->boot_mode = g_strdup(v);
+}
+
 static void htc_leo_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
 
+    object_class_property_add_str(oc, "boot-mode", leo_get_boot_mode,
+                                  leo_set_boot_mode);
+    object_class_property_set_description(oc, "boot-mode",
+        "without -kernel: boot from the NAND 'boot' (default) or "
+        "'recovery' partition");
     object_class_property_add(oc, "system-size", "uint32", leo_prop_get_u32,
                               leo_prop_set_u32, NULL,
                               (void *)offsetof(HtcLeoMachineState, system_mb));

@@ -1,0 +1,15 @@
+# CWM 5.0.2.6 (leo): install the first zip on the SD card
+sleep 25
+key voldown
+key voldown
+key voldown
+key voldown
+key call        # install zip from sdcard
+sleep 2
+key call        # choose zip from sdcard
+sleep 3
+key call        # first zip
+sleep 2
+key call        # Yes - Install
+sleep 60
+shot build/install-done.png

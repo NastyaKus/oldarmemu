@@ -85,7 +85,6 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmNandState, MSM_NAND)
 #define PAGE_DATA               2048
 #define PAGE_RAW                (CW_SIZE * CW_PER_PAGE)      /* 2112 */
 #define PAGES_PER_BLOCK         64
-#define CW_SPARE_OFF            (CW_USER + 10)               /* 526 */
 
 struct MsmNandState {
     SysBusDevice parent_obj;
@@ -152,7 +151,7 @@ static uint64_t cw_offset(uint32_t page, uint32_t cw)
 static int nand_bbm_pos(MsmNandState *s)
 {
     int pos = (int)((s->cfg1 >> 6) & 0x3ff) - 1;
-    if (pos < 0 || pos >= CW_USER) {
+    if (pos < 0 || pos >= CW_SIZE - 2) {
         pos = PAGE_DATA - CW_SIZE * (CW_PER_PAGE - 1);   /* 464 */
     }
     return pos;
@@ -168,12 +167,38 @@ static bool nand_ecc_mode(MsmNandState *s)
     return !(s->cfg1 & CFG1_ECC_DISABLE);
 }
 
+/*
+ * When the marker column lies in the user data of the last codeword
+ * (CFG1 bit 16 clear), the controller keeps the factory marker intact by
+ * storing the user byte(s) of that column in the last bytes of the
+ * codeword instead.
+ */
 static bool nand_relocate_bbm(MsmNandState *s, uint32_t cw)
 {
     return nand_ecc_mode(s) && cw == CW_PER_PAGE - 1 &&
            !(s->cfg1 & CFG1_BAD_BLOCK_IN_SPARE);
 }
 
+#define BBM_SWAP_OFF(w)     (CW_SIZE - (w))
+
+/* codeword geometry from CFG0: user data, parity and spare byte counts */
+static void nand_cw_geometry(MsmNandState *s, int *ud, int *ecc, int *spare)
+{
+    *ud = (s->cfg0 >> 9) & 0x3ff;
+    *ecc = (s->cfg0 >> 19) & 0xf;
+    *spare = (s->cfg0 >> 23) & 0xf;
+    if (*ud == 0 || *ud + *ecc + *spare > CW_SIZE) {
+        *ud = 516;
+        *ecc = 10;
+        *spare = 0;
+    }
+}
+
+/*
+ * Reading in ECC mode the buffer mirrors the physical codeword
+ * [user data][parity][spare][...]; the controller would correct bit
+ * errors, which we never have.
+ */
 static void nand_read_cw(MsmNandState *s)
 {
     uint8_t phys[CW_SIZE];
@@ -186,20 +211,18 @@ static void nand_read_cw(MsmNandState *s)
         memset(s->buf, 0xff, sizeof(s->buf));
         return;
     }
-    if (!nand_ecc_mode(s)) {
-        memcpy(s->buf, phys, CW_SIZE);
-        return;
-    }
-    memset(s->buf, 0xff, sizeof(s->buf));
-    memcpy(s->buf, phys, CW_USER);
+    memcpy(s->buf, phys, CW_SIZE);
     if (nand_relocate_bbm(s, s->cur_cw)) {
         int pos = nand_bbm_pos(s), w = nand_bbm_width(s);
-        memcpy(s->buf + pos, phys + CW_SPARE_OFF, w);
+        memcpy(s->buf + pos, phys + BBM_SWAP_OFF(w), w);
+        memset(s->buf + BBM_SWAP_OFF(w), 0xff, w);
     }
-    /* parity bytes are visible after the user data */
-    memcpy(s->buf + CW_USER, phys + CW_USER, CW_SIZE - CW_USER);
 }
 
+/*
+ * Programming in ECC mode software supplies [user data][spare] and the
+ * controller inserts the parity bytes in between.
+ */
 static void nand_program_cw(MsmNandState *s)
 {
     uint8_t phys[CW_SIZE], data[CW_SIZE];
@@ -213,11 +236,14 @@ static void nand_program_cw(MsmNandState *s)
     }
     memset(data, 0xff, sizeof(data));
     if (nand_ecc_mode(s)) {
-        memcpy(data, s->buf, CW_USER);
-        memset(data + CW_USER, 0x00, 10);    /* fake parity: "programmed" */
+        int ud, ecc, spare;
+        nand_cw_geometry(s, &ud, &ecc, &spare);
+        memcpy(data, s->buf, ud);
+        memset(data + ud, 0x00, ecc);           /* fake parity: "programmed" */
+        memcpy(data + ud + ecc, s->buf + ud, spare);
         if (nand_relocate_bbm(s, s->cur_cw)) {
             int pos = nand_bbm_pos(s), w = nand_bbm_width(s);
-            memcpy(data + CW_SPARE_OFF, s->buf + pos, w);
+            memcpy(data + BBM_SWAP_OFF(w), s->buf + pos, w);
             memset(data + pos, 0xff, w);
         }
     } else {
@@ -260,8 +286,14 @@ static void nand_set_address(MsmNandState *s)
     s->cur_cw = col / CW_SIZE;
 }
 
+static bool nand_trace;
+
 static void nand_exec(MsmNandState *s)
 {
+    if (nand_trace) {
+        fprintf(stderr, "nand: cmd %02x page %u cw %u cfg0 %08x cfg1 %08x\n",
+                s->cmd & 0xff, s->cur_page, s->cur_cw, s->cfg0, s->cfg1);
+    }
     switch (s->cmd & 0xff) {
     case CMD_SOFT_RESET:
     case CMD_RESET:
@@ -380,6 +412,39 @@ static const MemoryRegionOps nand_ops = {
     .impl = { .min_access_size = 1, .max_access_size = 4 },
 };
 
+/*
+ * Read one page as the HD2 kernels (htcleo_nand) and cLK lay it out:
+ * per codeword 512 data + 10 parity + 4 spare + 2 marker bytes; the
+ * 16 free OOB bytes are the four 4-byte spare areas.  Used by the board
+ * code to boot straight from NAND.
+ */
+bool msm_nand_read_page(DeviceState *dev, uint32_t page, uint8_t *data,
+                        uint8_t *oob)
+{
+    MsmNandState *s = MSM_NAND(dev);
+    const int pos = PAGE_DATA - CW_SIZE * (CW_PER_PAGE - 1);   /* 464 */
+
+    if (page >= s->npages) {
+        return false;
+    }
+    for (int cw = 0; cw < CW_PER_PAGE; cw++) {
+        uint8_t phys[CW_SIZE];
+        if (!nand_load(s, cw_offset(page, cw), phys, CW_SIZE)) {
+            return false;
+        }
+        if (cw == CW_PER_PAGE - 1) {
+            memcpy(phys + pos, phys + BBM_SWAP_OFF(2), 2);
+        }
+        if (data) {
+            memcpy(data + cw * 512, phys, 512);
+        }
+        if (oob) {
+            memcpy(oob + cw * 4, phys + 512 + 10, 4);
+        }
+    }
+    return true;
+}
+
 static void nand_reset(DeviceState *dev)
 {
     MsmNandState *s = MSM_NAND(dev);
@@ -442,6 +507,7 @@ static void nand_realize(DeviceState *dev, Error **errp)
     } else {
         s->ram = g_malloc0(want);   /* inverted storage: zero == erased */
     }
+    nand_trace = getenv("LEO_NAND_TRACE") != NULL;
     memory_region_init_io(&s->iomem, OBJECT(s), &nand_ops, s, "msm-nand",
                           0x1000);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);

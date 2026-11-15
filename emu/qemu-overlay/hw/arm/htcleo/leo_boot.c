@@ -14,6 +14,7 @@
 #include "qemu/error-report.h"
 #include "hw/boards.h"
 #include "leo_boot.h"
+#include "msm.h"
 
 #define BOOT_MAGIC          "ANDROID!"
 #define BOOT_MAGIC_SIZE     8
@@ -141,4 +142,180 @@ void leo_cleanup_tmp(MachineState *m)
     if (m->initrd_filename && strstr(m->initrd_filename, "leo-ramdisk-")) {
         unlink(m->initrd_filename);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* Booting from a NAND partition                                       */
+/* ------------------------------------------------------------------ */
+
+#define NAND_PAGE           2048
+#define NAND_PAGES_PER_BLK  64
+
+/* yaffs2 "tags only" layout in the 16 free OOB bytes */
+#define YAFFS_EXTRA_HEADER_INFO_FLAG    0x80000000u
+#define YAFFS_ALL_EXTRA_FLAGS           0xF0000000u
+#define YAFFS_OBJ_ROOT                  1
+#define YAFFS_OBJECT_TYPE_FILE          1
+#define YAFFS_HDR_NAME_OFF              10
+#define YAFFS_HDR_SIZE_OFF              292
+
+typedef struct YaffsChunk {
+    uint32_t seq;
+    uint32_t page;
+    uint32_t nbytes;
+} YaffsChunk;
+
+typedef struct YaffsObj {
+    uint32_t seq;           /* sequence of the newest header */
+    uint32_t parent;
+    uint32_t type;
+    uint32_t size;
+    char name[256];
+    GHashTable *chunks;     /* chunk id -> YaffsChunk* */
+} YaffsObj;
+
+static void yaffs_obj_free(gpointer p)
+{
+    YaffsObj *o = p;
+    g_hash_table_destroy(o->chunks);
+    g_free(o);
+}
+
+static YaffsObj *yaffs_obj(GHashTable *objs, uint32_t id)
+{
+    YaffsObj *o = g_hash_table_lookup(objs, GUINT_TO_POINTER(id));
+    if (!o) {
+        o = g_new0(YaffsObj, 1);
+        o->chunks = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                          NULL, g_free);
+        g_hash_table_insert(objs, GUINT_TO_POINTER(id), o);
+    }
+    return o;
+}
+
+/* Scan a yaffs2 partition; returns object table keyed by object id. */
+static GHashTable *yaffs_scan(DeviceState *nand, uint32_t first_page,
+                              uint32_t npages)
+{
+    GHashTable *objs = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                             NULL, yaffs_obj_free);
+    uint8_t data[NAND_PAGE], oob[16];
+
+    for (uint32_t p = 0; p < npages; p++) {
+        uint32_t page = first_page + p;
+        if (!msm_nand_read_page(nand, page, data, oob)) {
+            break;
+        }
+        uint32_t seq = ldl_le_p(oob), obj = ldl_le_p(oob + 4);
+        uint32_t chunk = ldl_le_p(oob + 8), nbytes = ldl_le_p(oob + 12);
+
+        if (seq == 0 || seq == 0xffffffff) {
+            continue;       /* erased or unused */
+        }
+        if (chunk & YAFFS_EXTRA_HEADER_INFO_FLAG) {
+            chunk = 0;
+        }
+        obj &= ~YAFFS_ALL_EXTRA_FLAGS;
+
+        YaffsObj *o = yaffs_obj(objs, obj);
+        if (chunk == 0) {
+            if (seq >= o->seq) {
+                o->seq = seq;
+                o->type = ldl_le_p(data);
+                o->parent = ldl_le_p(data + 4);
+                memcpy(o->name, data + YAFFS_HDR_NAME_OFF, 255);
+                o->name[255] = 0;
+                o->size = ldl_le_p(data + YAFFS_HDR_SIZE_OFF);
+            }
+        } else {
+            YaffsChunk *c = g_hash_table_lookup(o->chunks,
+                                                GUINT_TO_POINTER(chunk));
+            if (!c) {
+                c = g_new0(YaffsChunk, 1);
+                g_hash_table_insert(o->chunks, GUINT_TO_POINTER(chunk), c);
+            }
+            if (seq >= c->seq) {
+                c->seq = seq;
+                c->page = page;
+                c->nbytes = nbytes;
+            }
+        }
+    }
+    return objs;
+}
+
+static uint8_t *yaffs_read_file(DeviceState *nand, GHashTable *objs,
+                                const char *name, size_t *len)
+{
+    GHashTableIter it;
+    gpointer k, v;
+
+    g_hash_table_iter_init(&it, objs);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        YaffsObj *o = v;
+        if (o->type != YAFFS_OBJECT_TYPE_FILE || o->parent != YAFFS_OBJ_ROOT ||
+            strcmp(o->name, name)) {
+            continue;
+        }
+        uint8_t *buf = g_malloc0(o->size ? o->size : 1);
+        for (uint32_t off = 0; off < o->size; off += NAND_PAGE) {
+            YaffsChunk *c = g_hash_table_lookup(
+                o->chunks, GUINT_TO_POINTER(off / NAND_PAGE + 1));
+            uint8_t page[NAND_PAGE];
+            if (!c || !msm_nand_read_page(nand, c->page, page, NULL)) {
+                g_free(buf);
+                return NULL;
+            }
+            memcpy(buf + off, page, MIN(NAND_PAGE, o->size - off));
+        }
+        *len = o->size;
+        return buf;
+    }
+    return NULL;
+}
+
+bool leo_boot_from_nand(MachineState *m, DeviceState *nand,
+                        uint32_t start_block, uint32_t nblocks,
+                        const char *what, Error **errp)
+{
+    uint32_t first = start_block * NAND_PAGES_PER_BLK;
+    uint32_t npages = nblocks * NAND_PAGES_PER_BLK;
+    uint8_t page[NAND_PAGE];
+
+    if (!msm_nand_read_page(nand, first, page, NULL)) {
+        error_setg(errp, "htc-leo: cannot read the %s partition", what);
+        return false;
+    }
+
+    /* raw Android boot image, as written by fastboot / flash_image */
+    if (leo_is_android_bootimg(page, sizeof(page))) {
+        size_t len = (size_t)npages * NAND_PAGE;
+        g_autofree uint8_t *img = g_malloc(len);
+        for (uint32_t p = 0; p < npages; p++) {
+            if (!msm_nand_read_page(nand, first + p, img + p * NAND_PAGE,
+                                    NULL)) {
+                error_setg(errp, "htc-leo: NAND read error in %s", what);
+                return false;
+            }
+        }
+        info_report("htc-leo: booting Android boot image from NAND %s", what);
+        return leo_use_android_bootimg(m, img, len, errp);
+    }
+
+    /* yaffs2 partition holding zImage + initrd.gz (MAGLDR / cLK style) */
+    {
+        g_autoptr(GHashTable) objs = yaffs_scan(nand, first, npages);
+        size_t klen = 0, rlen = 0;
+        g_autofree uint8_t *k = yaffs_read_file(nand, objs, "zImage", &klen);
+        g_autofree uint8_t *r = yaffs_read_file(nand, objs, "initrd.gz", &rlen);
+
+        if (k) {
+            info_report("htc-leo: booting zImage (%zu bytes) + initrd.gz "
+                        "(%zu bytes) from yaffs2 %s", klen, rlen, what);
+            return leo_use_kernel_initrd(m, k, klen, r, rlen, "", errp);
+        }
+    }
+    error_setg(errp, "htc-leo: nothing bootable in the NAND %s partition "
+               "(flash a ROM or recovery first)", what);
+    return false;
 }

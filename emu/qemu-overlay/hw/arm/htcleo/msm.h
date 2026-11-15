@@ -108,6 +108,10 @@ DeviceState *msm_stub_create(const char *name, hwaddr base, uint64_t size,
 /* Set the idle level of an input GPIO pin (pull-up/down on the board). */
 void msm_gpio_set_default(DeviceState *dev, int n, bool level);
 
+/* NAND page as Linux sees it: 2048 data bytes + 16 free OOB bytes. */
+bool msm_nand_read_page(DeviceState *dev, uint32_t page, uint8_t *data,
+                        uint8_t *oob);
+
 /* Press/release an HD2 hardware button (index, see htc_leo.c). */
 void leo_set_key(int key, bool down);
 
