@@ -3,7 +3,9 @@
  * large-page NAND chip (2048 + 64 byte pages, 64 pages per block).
  *
  * The backing image stores the *physical* flash contents: per page
- * 4 codewords of 528 bytes (2112 bytes).  A codeword written in ECC mode
+ * 4 codewords of 528 bytes (2112 bytes), bit-inverted so that erased
+ * flash (0xFF) is all zeroes on disk: images are sparse and an empty
+ * file is a fully erased chip.  A codeword written in ECC mode
  * holds 516 user bytes + 10 parity bytes + spare.  As on the real
  * controller the user byte(s) that would land on the factory bad block
  * marker column of the last codeword are relocated to the spare area,
@@ -109,21 +111,35 @@ struct MsmNandState {
 
 /* ---- backing store ---- */
 
+static void invert(uint8_t *p, int len)
+{
+    for (int i = 0; i < len; i++) {
+        p[i] = ~p[i];
+    }
+}
+
 static bool nand_load(MsmNandState *s, uint64_t off, void *buf, int len)
 {
     if (s->blk) {
-        return blk_pread(s->blk, off, len, buf, 0) >= 0;
+        if (blk_pread(s->blk, off, len, buf, 0) < 0) {
+            return false;
+        }
+    } else {
+        memcpy(buf, s->ram + off, len);
     }
-    memcpy(buf, s->ram + off, len);
+    invert(buf, len);
     return true;
 }
 
 static bool nand_store(MsmNandState *s, uint64_t off, const void *buf, int len)
 {
+    g_autofree uint8_t *tmp = g_memdup2(buf, len);
+
+    invert(tmp, len);
     if (s->blk) {
-        return blk_pwrite(s->blk, off, len, buf, 0) >= 0;
+        return blk_pwrite(s->blk, off, len, tmp, 0) >= 0;
     }
-    memcpy(s->ram + off, buf, len);
+    memcpy(s->ram + off, tmp, len);
     return true;
 }
 
@@ -404,20 +420,27 @@ static void nand_realize(DeviceState *dev, Error **errp)
 
     if (s->blk) {
         int64_t len = blk_getlength(s->blk);
+        bool rw = blk_supports_write_perm(s->blk);
         uint64_t perm = BLK_PERM_CONSISTENT_READ |
-                        (blk_supports_write_perm(s->blk) ? BLK_PERM_WRITE : 0);
+                        (rw ? BLK_PERM_WRITE | BLK_PERM_RESIZE : 0);
         if (blk_set_perm(s->blk, perm, BLK_PERM_ALL, errp) < 0) {
             return;
         }
+        if (len >= 0 && (uint64_t)len < want && rw) {
+            /* grow (e.g. a fresh empty file) into an erased chip */
+            if (blk_truncate(s->blk, want, false, PREALLOC_MODE_OFF, 0,
+                             errp) < 0) {
+                return;
+            }
+            len = want;
+        }
         if (len < 0 || (uint64_t)len < want) {
             error_setg(errp, "msm-nand: image must be at least %" PRIu64
-                       " bytes (%u MiB in 2112-byte pages), use "
-                       "tools/mknand.py to create one", want, s->size_mb);
+                       " bytes (%u MiB in 2112-byte pages)", want, s->size_mb);
             return;
         }
     } else {
-        s->ram = g_malloc(want);
-        memset(s->ram, 0xff, want);
+        s->ram = g_malloc0(want);   /* inverted storage: zero == erased */
     }
     memory_region_init_io(&s->iomem, OBJECT(s), &nand_ops, s, "msm-nand",
                           0x1000);

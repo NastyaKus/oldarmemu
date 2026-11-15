@@ -99,10 +99,17 @@ static void gpio_pin_changed(MsmGpioState *s, int b, uint32_t old_in)
     s->latched[b] |= (rise & s->pos[b]) | (fall & ~s->pos[b]);
 }
 
+/* level seen on the board wire: driven value, or the pull when hi-Z */
+static uint32_t bank_wire(MsmGpioState *s, int b, uint32_t out, uint32_t oe)
+{
+    return (out & oe) | (s->ext_default[b] & ~oe);
+}
+
 static void gpio_drive_outputs(MsmGpioState *s, int b, uint32_t old_out,
                                uint32_t old_oe)
 {
-    uint32_t old = old_out & old_oe, now = s->out_val[b] & s->oe[b];
+    uint32_t old = bank_wire(s, b, old_out, old_oe);
+    uint32_t now = bank_wire(s, b, s->out_val[b], s->oe[b]);
     uint32_t diff = old ^ now;
 
     while (diff) {

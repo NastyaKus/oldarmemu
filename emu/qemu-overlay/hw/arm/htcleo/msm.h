@@ -99,6 +99,7 @@
 #define TYPE_HTC_MICROP "htc-microp"
 #define TYPE_I2C_REGFILE "i2c-regfile"
 #define TYPE_MSM_MDP    "msm-mdp"
+#define TYPE_MSM_SDCC   "msm-sdcc"
 
 /* Create a logging, memory-like placeholder for unmodelled hardware. */
 DeviceState *msm_stub_create(const char *name, hwaddr base, uint64_t size,
@@ -106,6 +107,9 @@ DeviceState *msm_stub_create(const char *name, hwaddr base, uint64_t size,
 
 /* Set the idle level of an input GPIO pin (pull-up/down on the board). */
 void msm_gpio_set_default(DeviceState *dev, int n, bool level);
+
+/* Press/release an HD2 hardware button (index, see htc_leo.c). */
+void leo_set_key(int key, bool down);
 
 /* Set the value a stub register holds after reset (bootloader state). */
 void msm_stub_preset(DeviceState *dev, hwaddr off, uint32_t val);

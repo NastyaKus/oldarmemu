@@ -9,4 +9,5 @@ LOG="${UNIMP_LOG:-$ROOT/build/leo-unimp.log}"
 exec timeout "$T" "$Q" -M htc-leo -kernel "$K" \
     -append "${CMDLINE:-console=ram}" \
     -display none -serial stdio -monitor "${MONITOR:-none}" \
+    ${QMP:+-qmp unix:$QMP,server,nowait} \
     -d unimp,guest_errors -D "$LOG" "$@"

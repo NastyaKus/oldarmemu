@@ -12,4 +12,5 @@ arm_common_ss.add(when: 'CONFIG_HTC_LEO', if_true: files(
   'leo_i2c_devs.c',
   'msm_mdp.c',
   'leo_boot.c',
+  'msm_sdcc.c',
 ))

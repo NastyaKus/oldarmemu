@@ -20,9 +20,11 @@
 #include "hw/qdev-properties.h"
 #include "hw/irq.h"
 #include "hw/i2c/i2c.h"
+#include "hw/sd/sd.h"
 #include "system/blockdev.h"
 #include "hw/qdev-properties-system.h"
 #include "chardev/char-fe.h"
+#include "ui/input.h"
 #include "system/system.h"
 #include "system/reset.h"
 #include "system/address-spaces.h"
@@ -52,6 +54,11 @@ struct HtcLeoMachineState {
     uint32_t nand_mb;
     uint32_t system_mb;
     uint32_t cache_mb;
+
+    /* keypad matrix (3 driven columns x 3 sensed rows) + power key */
+    uint32_t keys_down;         /* bit = col * 3 + row; bit 9 = power */
+    bool kp_col_level[3];
+    qemu_irq *kp_col_in;
 
     /* ram_console tap */
     QEMUTimer *rc_timer;
@@ -224,8 +231,6 @@ static void leo_map_stubs(void)
     static const struct { const char *name; hwaddr base; uint64_t size; } st[] = {
         { "gpu",       MSM_GPU_REG_PHYS,   0x20000 },
         { "uartdm1",   MSM_UART1DM_PHYS,   0x1000 },
-        { "sdc1",      MSM_SDC1_PHYS,      0x1000 },
-        { "sdc2",      MSM_SDC2_PHYS,      0x1000 },
         { "sdc3",      MSM_SDC3_PHYS,      0x1000 },
         { "sdc4",      MSM_SDC4_PHYS,      0x1000 },
         { "hsusb",     MSM_HSUSB_PHYS,     0x1000 },
@@ -284,12 +289,30 @@ static void leo_map_stubs(void)
 #define LEO_GPIO_KP_MPIN0       42
 #define LEO_GPIO_KP_MPIN1       41
 #define LEO_GPIO_KP_MPIN2       40
+#define LEO_GPIO_KP_MKOUT0      33
+#define LEO_GPIO_KP_MKOUT1      32
+#define LEO_GPIO_KP_MKOUT2      31
+
+/* HD2 hardware buttons: index = col * 3 + row (board-htcleo-keypad.c) */
+enum {
+    LEO_KEY_VOLUP = 0,      /* col 0 row 0 */
+    LEO_KEY_VOLDOWN = 1,    /* col 0 row 1 */
+    LEO_KEY_WINDOWS = 3,    /* col 1 row 0, KEY_MENU */
+    LEO_KEY_CALL = 4,       /* col 1 row 1, KEY_SEND */
+    LEO_KEY_END = 5,        /* col 1 row 2 */
+    LEO_KEY_BACK = 6,       /* col 2 row 0 */
+    LEO_KEY_HOME = 7,       /* col 2 row 1 */
+    LEO_KEY_POWER = 9,      /* GPIO 94 */
+};
 
 /* idle levels of input pins as set by board pull-ups */
 static void leo_gpio_defaults(DeviceState *gpio)
 {
+    bool have_sd = drive_get(IF_SD, 0, 0) != NULL;
+
     msm_gpio_set_default(gpio, LEO_GPIO_POWER_KEY, 1);   /* active low */
-    msm_gpio_set_default(gpio, LEO_GPIO_SD_STATUS, 1);   /* no card */
+    /* card detect is active low */
+    msm_gpio_set_default(gpio, LEO_GPIO_SD_STATUS, !have_sd);
     msm_gpio_set_default(gpio, LEO_GPIO_HDS_MIC, 1);     /* no headset mic */
     msm_gpio_set_default(gpio, LEO_GPIO_HDS_DET, 1);     /* no headset */
     msm_gpio_set_default(gpio, LEO_GPIO_UP_INT_N, 1);    /* microp idle */
@@ -297,7 +320,88 @@ static void leo_gpio_defaults(DeviceState *gpio)
     msm_gpio_set_default(gpio, LEO_GPIO_KP_MPIN0, 1);    /* keypad matrix */
     msm_gpio_set_default(gpio, LEO_GPIO_KP_MPIN1, 1);    /* inputs pulled */
     msm_gpio_set_default(gpio, LEO_GPIO_KP_MPIN2, 1);    /* up */
+    msm_gpio_set_default(gpio, LEO_GPIO_KP_MKOUT0, 1);   /* columns are */
+    msm_gpio_set_default(gpio, LEO_GPIO_KP_MKOUT1, 1);   /* pulled up when */
+    msm_gpio_set_default(gpio, LEO_GPIO_KP_MKOUT2, 1);   /* not scanned */
 }
+
+static const int leo_kp_row_gpio[3] = {
+    LEO_GPIO_KP_MPIN0, LEO_GPIO_KP_MPIN1, LEO_GPIO_KP_MPIN2
+};
+
+/* recompute the sensed rows from driven columns and pressed keys */
+static void leo_keypad_update(HtcLeoMachineState *s)
+{
+    for (int row = 0; row < 3; row++) {
+        bool level = true;
+        for (int col = 0; col < 3; col++) {
+            if ((s->keys_down & (1u << (col * 3 + row))) &&
+                !s->kp_col_level[col]) {
+                level = false;
+            }
+        }
+        qemu_set_irq(qdev_get_gpio_in(s->gpio, leo_kp_row_gpio[row]), level);
+    }
+    qemu_set_irq(qdev_get_gpio_in(s->gpio, LEO_GPIO_POWER_KEY),
+                 !(s->keys_down & (1u << LEO_KEY_POWER)));
+}
+
+static void leo_kp_col_changed(void *opaque, int col, int level)
+{
+    HtcLeoMachineState *s = opaque;
+    s->kp_col_level[col] = level;
+    leo_keypad_update(s);
+}
+
+void leo_set_key(int key, bool down)
+{
+    HtcLeoMachineState *s = HTC_LEO_MACHINE(qdev_get_machine());
+    if (down) {
+        s->keys_down |= 1u << key;
+    } else {
+        s->keys_down &= ~(1u << key);
+    }
+    leo_keypad_update(s);
+}
+
+/* host keyboard -> HD2 buttons */
+static int leo_qcode_to_key(int qcode)
+{
+    switch (qcode) {
+    case Q_KEY_CODE_UP:
+    case Q_KEY_CODE_PGUP:       return LEO_KEY_VOLUP;
+    case Q_KEY_CODE_DOWN:
+    case Q_KEY_CODE_PGDN:       return LEO_KEY_VOLDOWN;
+    case Q_KEY_CODE_F1:
+    case Q_KEY_CODE_M:          return LEO_KEY_WINDOWS;
+    case Q_KEY_CODE_F2:
+    case Q_KEY_CODE_RET:        return LEO_KEY_CALL;
+    case Q_KEY_CODE_F3:
+    case Q_KEY_CODE_END:        return LEO_KEY_END;
+    case Q_KEY_CODE_ESC:
+    case Q_KEY_CODE_BACKSPACE:  return LEO_KEY_BACK;
+    case Q_KEY_CODE_HOME:
+    case Q_KEY_CODE_H:          return LEO_KEY_HOME;
+    case Q_KEY_CODE_F4:
+    case Q_KEY_CODE_P:          return LEO_KEY_POWER;
+    default:                    return -1;
+    }
+}
+
+static void leo_kbd_event(DeviceState *dev, QemuConsole *src, InputEvent *evt)
+{
+    InputKeyEvent *key = evt->u.key.data;
+    int k = leo_qcode_to_key(qemu_input_key_value_to_qcode(key->key));
+    if (k >= 0) {
+        leo_set_key(k, key->down);
+    }
+}
+
+static const QemuInputHandler leo_kbd_handler = {
+    .name  = "HTC HD2 buttons",
+    .mask  = INPUT_EVENT_MASK_KEY,
+    .event = leo_kbd_event,
+};
 
 static void htc_leo_init(MachineState *machine)
 {
@@ -421,6 +525,44 @@ static void htc_leo_init(MachineState *machine)
         sysbus_connect_irq(SYS_BUS_DEVICE(mdp), 0,
                            qdev_get_gpio_in(s->vic, INT_MDP));
     }
+
+    /* SDC1: Wi-Fi SDIO slot (no card yet), SDC2: microSD slot */
+    {
+        static const struct { hwaddr base; int irq0, irq1; } sdc[] = {
+            { MSM_SDC1_PHYS, INT_SDC1_0, INT_SDC1_1 },
+            { MSM_SDC2_PHYS, INT_SDC2_0, INT_SDC2_1 },
+        };
+        for (int i = 0; i < ARRAY_SIZE(sdc); i++) {
+            DeviceState *d = qdev_new(TYPE_MSM_SDCC);
+            sysbus_realize_and_unref(SYS_BUS_DEVICE(d), &error_fatal);
+            sysbus_mmio_map(SYS_BUS_DEVICE(d), 0, sdc[i].base);
+            sysbus_connect_irq(SYS_BUS_DEVICE(d), 0,
+                               qdev_get_gpio_in(s->vic, sdc[i].irq0));
+            sysbus_connect_irq(SYS_BUS_DEVICE(d), 1,
+                               qdev_get_gpio_in(s->vic, sdc[i].irq1));
+            if (i == 1) {
+                DriveInfo *di = drive_get(IF_SD, 0, 0);
+                if (di) {
+                    DeviceState *card = qdev_new(TYPE_SD_CARD);
+                    qdev_prop_set_drive_err(card, "drive",
+                                            blk_by_legacy_dinfo(di),
+                                            &error_fatal);
+                    qdev_realize_and_unref(card,
+                                           qdev_get_child_bus(d, "sd-bus"),
+                                           &error_fatal);
+                }
+            }
+        }
+    }
+
+    /* hardware buttons */
+    s->kp_col_in = qemu_allocate_irqs(leo_kp_col_changed, s, 3);
+    s->kp_col_level[0] = s->kp_col_level[1] = s->kp_col_level[2] = true;
+    qdev_connect_gpio_out_named(s->gpio, "out", LEO_GPIO_KP_MKOUT0, s->kp_col_in[0]);
+    qdev_connect_gpio_out_named(s->gpio, "out", LEO_GPIO_KP_MKOUT1, s->kp_col_in[1]);
+    qdev_connect_gpio_out_named(s->gpio, "out", LEO_GPIO_KP_MKOUT2, s->kp_col_in[2]);
+    qemu_input_handler_activate(
+        qemu_input_handler_register(DEVICE(s->gpio), &leo_kbd_handler));
 
     leo_map_stubs();
 
