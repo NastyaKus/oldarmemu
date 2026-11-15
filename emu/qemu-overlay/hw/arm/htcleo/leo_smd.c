@@ -21,6 +21,7 @@
 #include "qemu/log.h"
 #include "qemu/cutils.h"
 #include "hw/irq.h"
+#include "system/rtc.h"
 #include "msm_a9.h"
 
 /* SMEM item ids (CONFIG_MSM_N_WAY_SMD numbering) */
@@ -126,7 +127,51 @@ static const struct {
     { 0x30100001, 0x00000000 },     /* HTC battery (APP_BATT) */
     { 0x30100002, 0x00000000 },     /* HTC acoustic */
     { 0x30100003, 0x00000000 },     /* HTC acoustic (QSD) */
+    { 0x30000048, 0x00010001 },     /* TIMEREMOTE: the RTC */
 };
+
+#define TIMEREMOTE_PROG                 0x30000048
+#define TIMEREMOTE_SET_JULIAN           6
+#define TIMEREMOTE_GET_JULIAN           7
+
+/* modem RTC = QEMU's RTC (host clock, -rtc base=...) + what the guest set */
+static time_t rtc_offset;
+
+/*
+ * Fill the results of a call; returns their size.  args/argn: the XDR
+ * arguments after the call header.
+ */
+static uint32_t rpc_results(uint32_t prog, uint32_t proc, const uint8_t *args,
+                            uint32_t argn, uint8_t *res)
+{
+    if (prog == TIMEREMOTE_PROG && proc == TIMEREMOTE_GET_JULIAN) {
+        struct tm tm;
+
+        qemu_get_timedate(&tm, rtc_offset);
+        stl_be_p(res + 0, 1);                   /* opt_arg: data follows */
+        stl_be_p(res + 4, tm.tm_year + 1900);
+        stl_be_p(res + 8, tm.tm_mon + 1);
+        stl_be_p(res + 12, tm.tm_mday);
+        stl_be_p(res + 16, tm.tm_hour);
+        stl_be_p(res + 20, tm.tm_min);
+        stl_be_p(res + 24, tm.tm_sec);
+        stl_be_p(res + 28, tm.tm_wday);
+        return 32;
+    }
+    if (prog == TIMEREMOTE_PROG && proc == TIMEREMOTE_SET_JULIAN &&
+        argn >= 32 && ldl_be_p(args)) {
+        struct tm tm = {
+            .tm_year = ldl_be_p(args + 4) - 1900,
+            .tm_mon = ldl_be_p(args + 8) - 1,
+            .tm_mday = ldl_be_p(args + 12),
+            .tm_hour = ldl_be_p(args + 16),
+            .tm_min = ldl_be_p(args + 20),
+            .tm_sec = ldl_be_p(args + 24),
+        };
+        rtc_offset = qemu_timedate_diff(&tm);
+    }
+    return 0;
+}
 
 static void rr_send(A9SmdChan *c, uint32_t type, uint32_t src_cid,
                     uint32_t dst_pid, uint32_t dst_cid,
@@ -177,7 +222,7 @@ static void rr_handle_data(A9SmdChan *c, const uint8_t *h, const uint8_t *p,
 {
     uint32_t src_pid = ldl_le_p(h + 8), src_cid = ldl_le_p(h + 12);
     uint32_t confirm_rx = ldl_le_p(h + 16), dst_cid = ldl_le_p(h + 28);
-    uint32_t pm, xid, mtype;
+    uint32_t pm, xid, mtype, prog = 0, proc = 0;
     uint8_t reply[4 + 6 * 4 + 32];
 
     if (confirm_rx) {
@@ -194,11 +239,16 @@ static void rr_handle_data(A9SmdChan *c, const uint8_t *h, const uint8_t *p,
         return;     /* replies to our (non-existent) calls */
     }
     if (len >= 4 + 24) {
+        prog = ldl_be_p(p + 16);
+        proc = ldl_be_p(p + 24);
         qemu_log_mask(LOG_UNIMP, "leo-rpc: call prog 0x%08x vers 0x%08x "
-                      "proc %u\n", ldl_be_p(p + 16), ldl_be_p(p + 20),
-                      ldl_be_p(p + 24));
+                      "proc %u\n", prog, ldl_be_p(p + 20), proc);
     }
     memset(reply, 0, sizeof(reply));
+    /* call header: pacmark + 10 words (xid ... verifier) */
+    if (len >= 4 + 40) {
+        rpc_results(prog, proc, p + 44, len - 44, reply + 4 + 24);
+    }
     stl_le_p(reply, (sizeof(reply) - 4) | (((pm >> 16) & 0xff) << 16) |
                     (1u << 30) | (1u << 31));
     stl_be_p(reply + 4, xid);

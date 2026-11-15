@@ -55,12 +55,21 @@ class EmulatorActivity : Activity() {
         root.addView(hd2Buttons())
         setContentView(root)
 
-        val boot = if (intent.getStringExtra("boot") == "recovery")
-            QemuProcess.Boot.RECOVERY else QemuProcess.Boot.ANDROID
+        boot(if (intent.getStringExtra("boot") == "recovery")
+            QemuProcess.Boot.RECOVERY else QemuProcess.Boot.ANDROID)
+    }
+
+    private var poweredOff = false
+
+    private fun boot(mode: QemuProcess.Boot) {
+        poweredOff = false
+        vnc?.stop()
+        status.visibility = View.VISIBLE
         status.text = "Подготовка SD-карты…"
         Thread {
             try {
-                qemu.start(boot)
+                qemu.stop()
+                qemu.start(mode)
                 ui.post { status.text = "Запуск эмулятора…"; connect() }
             } catch (e: Exception) {
                 ui.post { status.text = "Не удалось запустить QEMU: ${e.message}" }
@@ -71,13 +80,28 @@ class EmulatorActivity : Activity() {
     private fun connect() {
         val client = VncClient(st.vncSocket,
             onFrame = { ui.post { status.visibility = View.GONE; screen.invalidate() } },
-            onError = { msg -> ui.post { showExit(msg) } })
+            onError = { msg ->
+                Thread { qemu.waitExit(3000); ui.post { showExit(msg) } }.start()
+            })
         vnc = client
         screen.client = client
         client.start()
     }
 
     private fun showExit(msg: String) {
+        // the guest rebooted or powered off: act like cLK / the power button
+        when (qemu.takeRebootRequest()) {
+            "android" -> { status.text = "Перезагрузка…"; boot(QemuProcess.Boot.ANDROID); return }
+            "recovery" -> { status.text = "Перезагрузка в recovery…"; boot(QemuProcess.Boot.RECOVERY); return }
+            "off" -> {
+                poweredOff = true
+                screen.client = null
+                screen.invalidate()
+                status.visibility = View.VISIBLE
+                status.text = "Телефон выключен.\nНажмите «Питание», чтобы включить."
+                return
+            }
+        }
         val code = qemu.exitCode()
         val log = java.io.File(st.dir, "qemu.log").takeIf { it.exists() }?.readText()?.takeLast(600) ?: ""
         status.visibility = View.VISIBLE
@@ -90,7 +114,14 @@ class EmulatorActivity : Activity() {
         isAllCaps = false
         setOnTouchListener { v, ev ->
             when (ev.actionMasked) {
-                MotionEvent.ACTION_DOWN -> { vnc?.key(keysym, true); v.isPressed = true }
+                MotionEvent.ACTION_DOWN -> {
+                    if (poweredOff && keysym == VncClient.KEY_POWER) {
+                        boot(QemuProcess.Boot.ANDROID)
+                    } else {
+                        vnc?.key(keysym, true)
+                    }
+                    v.isPressed = true
+                }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     vnc?.key(keysym, false); v.isPressed = false
                 }

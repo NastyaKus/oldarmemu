@@ -3,6 +3,8 @@
 
   leoctl.py SOCK key <name> [hold_ms]     press an HD2 button
   leoctl.py SOCK tap X Y                  tap the screen (480x800 coords)
+  leoctl.py SOCK swipe X1 Y1 X2 Y2        drag a finger
+  leoctl.py SOCK wake                     press power only if the screen is off
   leoctl.py SOCK shot out.png             screenshot
   leoctl.py SOCK hmp "<command>"          raw HMP command
   leoctl.py SOCK script FILE              run lines of the above (no SOCK)
@@ -63,6 +65,33 @@ def tap(q, x, y, hold=120):
     q.cmd("input-send-event", events=ev(False))
     time.sleep(0.25)
 
+def swipe(q, x1, y1, x2, y2, steps=12, ms=400):
+    def ev(x, y, down):
+        return [{"type": "abs", "data": {"axis": "x", "value": int(x * 0x7fff / 479)}},
+                {"type": "abs", "data": {"axis": "y", "value": int(y * 0x7fff / 799)}},
+                {"type": "btn", "data": {"down": down, "button": "left"}}]
+    for i in range(steps + 1):
+        x = x1 + (x2 - x1) * i / steps
+        y = y1 + (y2 - y1) * i / steps
+        q.cmd("input-send-event", events=ev(x, y, True))
+        time.sleep(ms / 1000 / steps)
+    q.cmd("input-send-event", events=ev(x2, y2, False))
+    time.sleep(0.25)
+
+def screen_on(q):
+    """True if the LCDC (MDP 0xAA2E0000) is scanning out."""
+    r = q.hmp("xp /1wx 0xaa2e0000")
+    return r.strip().endswith("0x00000001")
+
+def wake(q):
+    if not screen_on(q):
+        key(q, "power", 200)
+        for _ in range(30):
+            time.sleep(0.5)
+            if screen_on(q):
+                break
+    time.sleep(2)
+
 def shot(q, out):
     tmp = tempfile.mktemp(suffix=".ppm")
     q.cmd("screendump", filename=tmp)
@@ -79,6 +108,12 @@ def run(q, argv):
         key(q, argv[1], int(argv[2]) if len(argv) > 2 else 120)
     elif op == "tap":
         tap(q, int(argv[1]), int(argv[2]))
+    elif op == "wake":
+        wake(q)
+    elif op == "screen":
+        print("on" if screen_on(q) else "off")
+    elif op == "swipe":
+        swipe(q, *[int(v) for v in argv[1:5]])
     elif op == "shot":
         shot(q, argv[1])
     elif op == "hmp":

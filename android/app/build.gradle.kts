@@ -12,8 +12,8 @@ android {
         applicationId = "org.oldarmemu.hd2"
         minSdk = 28
         targetSdk = 34          // QEMU runs from nativeLibraryDir (exec allowed there)
-        versionCode = (System.getenv("VERSION_CODE") ?: "3").toInt()
-        versionName = System.getenv("VERSION_NAME") ?: "0.1.2"
+        versionCode = (System.getenv("VERSION_CODE") ?: "4").toInt()
+        versionName = System.getenv("VERSION_NAME") ?: "0.1.3"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 
@@ -57,4 +57,6 @@ dependencies {
 tasks.withType<Test> {
     systemProperty("fat.src", System.getProperty("fat.src") ?: "")
     systemProperty("fat.out", System.getProperty("fat.out") ?: "")
+    systemProperty("launcher.in", System.getProperty("launcher.in") ?: "")
+    systemProperty("launcher.out", System.getProperty("launcher.out") ?: "")
 }

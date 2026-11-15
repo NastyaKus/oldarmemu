@@ -10,3 +10,4 @@ android/app/src/main/jniLibs/
 android/app/*.keystore
 android/local.properties
 android/app/src/main/assets/qemu/
+__pycache__/

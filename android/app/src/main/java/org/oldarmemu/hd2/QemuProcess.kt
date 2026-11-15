@@ -26,13 +26,23 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
         return dir
     }
 
+    private val rebootFile get() = File(st.dir, "reboot.txt")
+
+    /** "android", "recovery" or "off" if the guest asked for it, else null. */
+    fun takeRebootRequest(): String? {
+        val f = rebootFile
+        if (process?.isAlive == true || !f.exists()) return null
+        return f.readText().trim().also { f.delete() }
+    }
+
     fun start(boot: Boot, nandMb: Int = 512) {
+        rebootFile.delete()
         st.vncSocket.delete()
         st.qmpSocket.delete()
         val args = mutableListOf(
             binary.absolutePath,
             "-L", dataDir().absolutePath,
-            "-M", "htc-leo,nand-size=$nandMb" +
+            "-M", "htc-leo,nand-size=$nandMb,reboot-file=${rebootFile.absolutePath}" +
                 if (boot == Boot.RECOVERY && !st.recovery.exists()) ",boot-mode=recovery" else "",
             "-accel", "tcg,tb-size=128",
             "-nodefaults",
@@ -62,6 +72,10 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
             if (!it.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) it.destroyForcibly()
         }
         process = null
+    }
+
+    fun waitExit(ms: Long) {
+        process?.waitFor(ms, java.util.concurrent.TimeUnit.MILLISECONDS)
     }
 
     fun exitCode(): Int? = process?.let { if (it.isAlive) null else it.exitValue() }

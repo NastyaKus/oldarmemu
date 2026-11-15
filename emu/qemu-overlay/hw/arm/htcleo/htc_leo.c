@@ -27,6 +27,7 @@
 #include "ui/input.h"
 #include "system/system.h"
 #include "system/reset.h"
+#include "system/runstate.h"
 #include "system/address-spaces.h"
 #include "target/arm/cpu-qom.h"
 #include "cpu.h"
@@ -55,6 +56,7 @@ struct HtcLeoMachineState {
     uint32_t system_mb;
     uint32_t cache_mb;
     char *boot_mode;
+    char *reboot_file;
 
     /* keypad matrix (3 driven columns x 3 sensed rows) + power key */
     uint32_t keys_down;         /* bit = col * 3 + row; bit 9 = power */
@@ -118,6 +120,8 @@ static int leo_build_ptable(HtcLeoMachineState *s, LeoPartition *p)
 }
 
 #define ATAG_MSM_PARTITION      0x4d534d70
+#define ATAG_MAGLDR_BOOT        0x4c47414d      /* "MAGL" */
+#define CLK_SIGNATURE           0x004b4c63      /* "cLK" */
 
 static int leo_atag_board(const struct arm_boot_info *info, void *p)
 {
@@ -138,7 +142,17 @@ static int leo_atag_board(const struct arm_boot_info *info, void *p)
         w[6] = 0;
         w += 7;
     }
-    return (2 + n * 7) * 4;
+    /*
+     * Like cLK (target/htcleo/atags.c): tell the kernel it was started
+     * from NAND by cLK.  Without it HD2 kernels assume a haret boot from
+     * WinMo: they start the RPC router themselves (and break when the
+     * modem says HELLO too) and avoid power collapse.
+     */
+    w[0] = cpu_to_le32(4);
+    w[1] = cpu_to_le32(ATAG_MAGLDR_BOOT);
+    w[2] = cpu_to_le32(CLK_SIGNATURE);
+    w[3] = cpu_to_le32(13);                 /* cLK version */
+    return (2 + n * 7 + 4) * 4;
 }
 
 /*
@@ -404,6 +418,39 @@ static const QemuInputHandler leo_kbd_handler = {
     .event = leo_kbd_event,
 };
 
+#define LEO_REBOOT_RECOVERY     0x77665502
+
+/*
+ * cLK picks the boot image from the restart reason.  QEMU cannot switch
+ * kernels on reset, so when a reboot-file is configured we record the
+ * wanted mode ("android", "recovery" or "off") and exit; the front end
+ * starts the emulator again in that mode.  Without one: plain reset.
+ */
+static void leo_finish(const char *mode)
+{
+    HtcLeoMachineState *s = HTC_LEO_MACHINE(qdev_get_machine());
+
+    info_report("htc-leo: guest requested %s", mode);
+    if (s->reboot_file) {
+        g_file_set_contents(s->reboot_file, mode, -1, NULL);
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+    } else if (!strcmp(mode, "off")) {
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+    } else {
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+    }
+}
+
+void leo_request_reboot(uint32_t reason)
+{
+    leo_finish(reason == LEO_REBOOT_RECOVERY ? "recovery" : "android");
+}
+
+void leo_request_power_off(void)
+{
+    leo_finish("off");
+}
+
 static void htc_leo_init(MachineState *machine)
 {
     HtcLeoMachineState *s = HTC_LEO_MACHINE(machine);
@@ -521,6 +568,7 @@ static void htc_leo_init(MachineState *machine)
         i2c_slave_create_simple(bus, TYPE_HTC_MICROP, 0xCC >> 1);
         i2c_slave_create_simple(bus, TYPE_I2C_REGFILE, 0x48);   /* tps65023 */
         i2c_slave_create_simple(bus, TYPE_I2C_REGFILE, 0x1C);   /* akm8973 */
+        i2c_slave_create_simple(bus, "leo-ds2746", 0x26);       /* fuel gauge */
     }
 
     /* display controller (MDP 3.1 + LCDC panel) */
@@ -666,9 +714,27 @@ static void leo_set_boot_mode(Object *obj, const char *v, Error **errp)
     s->boot_mode = g_strdup(v);
 }
 
+static char *leo_get_reboot_file(Object *obj, Error **errp)
+{
+    return g_strdup(HTC_LEO_MACHINE(obj)->reboot_file ?: "");
+}
+
+static void leo_set_reboot_file(Object *obj, const char *v, Error **errp)
+{
+    HtcLeoMachineState *s = HTC_LEO_MACHINE(obj);
+    g_free(s->reboot_file);
+    s->reboot_file = *v ? g_strdup(v) : NULL;
+}
+
 static void htc_leo_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add_str(oc, "reboot-file", leo_get_reboot_file,
+                                  leo_set_reboot_file);
+    object_class_property_set_description(oc, "reboot-file",
+        "on guest reboot/power off write the next mode (android, recovery, "
+        "off) to this file and exit instead of resetting");
 
     object_class_property_add_str(oc, "boot-mode", leo_get_boot_mode,
                                   leo_set_boot_mode);

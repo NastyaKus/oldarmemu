@@ -87,23 +87,41 @@ class Storage(private val ctx: Context) {
      * it reuses the ROM's own update-binary and rewrites egl.cfg.
      */
     private fun makeCompatZip(rom: File) {
+        val launcher = File(ctx.cacheDir, "Launcher2.apk")
+        val launcher2d = File(ctx.cacheDir, "Launcher2-2d.apk")
         val binary = try {
             ZipFile(rom).use { z ->
                 val e = z.getEntry("META-INF/com/google/android/update-binary") ?: return
+                z.getEntry(LAUNCHER2)?.let { l ->
+                    z.getInputStream(l).use { i -> launcher.outputStream().use { i.copyTo(it) } }
+                }
                 z.getInputStream(e).readBytes()
             }
         } catch (e: Exception) {
             return
+        }
+        val patched = try {
+            launcher.exists() && ApkPatcher.launcher2d(launcher, launcher2d, JarSigner(dir))
+        } catch (e: Exception) {
+            false
+        } finally {
+            launcher.delete()
         }
         val out = File(sdcard, "zz-hd2emu-compat.zip")
         ZipOutputStream(out.outputStream()).use { z ->
             z.putNextEntry(ZipEntry("META-INF/com/google/android/update-binary"))
             z.write(binary); z.closeEntry()
             z.putNextEntry(ZipEntry("META-INF/com/google/android/updater-script"))
-            z.write(COMPAT_SCRIPT.toByteArray()); z.closeEntry()
+            z.write(compatScript(patched).toByteArray()); z.closeEntry()
             z.putNextEntry(ZipEntry("egl.cfg"))
             z.write("0 0 android\n".toByteArray()); z.closeEntry()
+            if (patched) {
+                z.putNextEntry(ZipEntry("Launcher2.apk"))
+                launcher2d.inputStream().use { it.copyTo(z) }
+                z.closeEntry()
+            }
         }
+        launcher2d.delete()
     }
 
     /**
@@ -129,12 +147,25 @@ class Storage(private val ctx: Context) {
     }
 
     companion object {
-        const val COMPAT_SCRIPT = """ui_print("HD2 emulator compatibility");
+        const val LAUNCHER2 = "system/app/Launcher2.apk"
+
+        fun compatScript(launcher2d: Boolean) = buildString {
+            append("""ui_print("HD2 emulator compatibility");
 mount("yaffs2", "MTD", "system", "/system");
 package_extract_file("egl.cfg", "/system/lib/egl/egl.cfg");
 set_perm(0, 0, 0644, "/system/lib/egl/egl.cfg");
-unmount("/system");
-ui_print("software OpenGL ES enabled");
-"""
+delete("/system/lib/hw/copybit.qsd8k.so", "/system/lib/hw/copybit.msm7k.so");
+delete("/system/app/LiveWallpapers.apk", "/system/app/MagicSmokeWallpapers.apk",
+       "/system/app/VisualizationWallpapers.apk");
+""")
+            if (launcher2d) append("""package_extract_file("Launcher2.apk", "/$LAUNCHER2");
+set_perm(0, 0, 0644, "/$LAUNCHER2");
+""")
+            append("""unmount("/system");
+ui_print("software OpenGL ES enabled, copybit (MDP blitter) disabled");
+ui_print("RenderScript live wallpapers removed (need OpenGL ES 2.0)");
+""")
+            if (launcher2d) append("ui_print(\"Launcher2: 2D app drawer instead of RenderScript 3D\");\n")
+        }
     }
 }

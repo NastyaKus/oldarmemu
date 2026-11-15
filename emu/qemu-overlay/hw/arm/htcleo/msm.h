@@ -112,11 +112,21 @@ void msm_gpio_set_default(DeviceState *dev, int n, bool level);
 bool msm_nand_read_page(DeviceState *dev, uint32_t page, uint8_t *data,
                         uint8_t *oob);
 
+/*
+ * Guest asked the modem to restart (reason as in the HD2 kernel's pm.c,
+ * 0x77665502 = recovery) or to power off.
+ */
+void leo_request_reboot(uint32_t reason);
+void leo_request_power_off(void);
+
 /* Kernel fix-ups for emulation, see leo_quirks.c */
 void leo_apply_kernel_quirks(void);
 void leo_reset_kernel_quirks(void);
 void leo_quirks_set_ram(void *host, uint64_t size);
 bool leo_quirk_rename_smd_channel(const char *from, const char *to);
+
+/* Current GPT (32 kHz sleep clock) count, for the modem's time sync. */
+uint32_t msm_csr_gpt_count(void);
 
 /* Press/release an HD2 hardware button (index, see htc_leo.c). */
 void leo_set_key(int key, bool down);
