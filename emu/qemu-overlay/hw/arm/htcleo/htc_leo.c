@@ -237,7 +237,6 @@ static void leo_map_stubs(void)
         { "uart1",     MSM_UART1_PHYS,     0x1000 },
         { "uart2",     MSM_UART2_PHYS,     0x1000 },
         { "uart3",     MSM_UART3_PHYS,     0x1000 },
-        { "mdp",       MSM_MDP_PHYS,       0xF0000 },
         { "clk_sh2",   0xABA01000,         0x1000 },
     };
     /*
@@ -411,6 +410,15 @@ static void htc_leo_init(MachineState *machine)
         i2c_slave_create_simple(bus, TYPE_HTC_MICROP, 0xCC >> 1);
         i2c_slave_create_simple(bus, TYPE_I2C_REGFILE, 0x48);   /* tps65023 */
         i2c_slave_create_simple(bus, TYPE_I2C_REGFILE, 0x1C);   /* akm8973 */
+    }
+
+    /* display controller (MDP 3.1 + LCDC panel) */
+    {
+        DeviceState *mdp = qdev_new(TYPE_MSM_MDP);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(mdp), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(mdp), 0, MSM_MDP_PHYS);
+        sysbus_connect_irq(SYS_BUS_DEVICE(mdp), 0,
+                           qdev_get_gpio_in(s->vic, INT_MDP));
     }
 
     leo_map_stubs();

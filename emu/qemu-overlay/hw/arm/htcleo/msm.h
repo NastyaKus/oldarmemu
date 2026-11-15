@@ -98,6 +98,7 @@
 #define TYPE_LEO_TOUCH  "leo-touch"
 #define TYPE_HTC_MICROP "htc-microp"
 #define TYPE_I2C_REGFILE "i2c-regfile"
+#define TYPE_MSM_MDP    "msm-mdp"
 
 /* Create a logging, memory-like placeholder for unmodelled hardware. */
 DeviceState *msm_stub_create(const char *name, hwaddr base, uint64_t size,

@@ -10,7 +10,7 @@
 | ram_console mirror to serial | done |
 | I2C controller, touchscreen (type 2A), MicroP, regfile PMIC/compass | done |
 | Data mover (ADM), NAND (raw 2112-byte pages, cLK partition ATAG) | done |
-| MDP/LCDC display | todo |
+| MDP 3.1 + LCDC display (480x800, RGB565/XRGB8888) | done |
 | SDCC (microSD) | todo |
 | cLK boot from NAND | todo |
 | Android app | todo |
