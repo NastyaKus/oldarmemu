@@ -17,7 +17,7 @@ class Storage(private val ctx: Context) {
     val sdImage = File(dir, "sdcard.img")
     private val sdStamp = File(dir, "sdcard.stamp")
     val console = File(dir, "console.log")
-    val vncSocket = File(dir, "vnc.sock")
+    val hostlink = File(dir, "hostlink.shm")
     val qmpSocket = File(dir, "qmp.sock")
 
     fun displayName(uri: Uri): String {

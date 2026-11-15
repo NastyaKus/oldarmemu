@@ -37,6 +37,8 @@ typedef struct A9DalClient {
     uint32_t device_id;
     uint32_t cb_evt, loc_evt, session;
     int64_t busy_until;     /* playback clock for buffer pacing */
+    uint32_t rate, channels;    /* PCM format from the OPEN command */
+    bool playback;
 } A9DalClient;
 
 typedef struct A9PendingEvt {

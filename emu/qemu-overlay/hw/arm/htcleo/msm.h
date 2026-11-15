@@ -128,6 +128,14 @@ bool leo_quirk_rename_smd_channel(const char *from, const char *to);
 /* Current GPT (32 kHz sleep clock) count, for the modem's time sync. */
 uint32_t msm_csr_gpt_count(void);
 
+/* Shared memory link to the front end (screen, sound), leo_hostlink.c */
+bool leo_hostlink_open(const char *path, Error **errp);
+uint8_t *leo_hostlink_fb(void);                 /* NULL when not in use */
+void leo_hostlink_fb_done(int w, int h, bool lcd_on);
+void leo_hostlink_audio_format(uint32_t rate, uint32_t channels);
+void leo_hostlink_audio_write(const uint8_t *pcm, uint32_t len);
+void leo_pin_fast_cpus(void);
+
 /* Press/release an HD2 hardware button (index, see htc_leo.c). */
 void leo_set_key(int key, bool down);
 

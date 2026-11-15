@@ -57,6 +57,8 @@ struct HtcLeoMachineState {
     uint32_t cache_mb;
     char *boot_mode;
     char *reboot_file;
+    char *hostlink;
+    bool pin_cpu;
 
     /* keypad matrix (3 driven columns x 3 sensed rows) + power key */
     uint32_t keys_down;         /* bit = col * 3 + row; bit 9 = power */
@@ -462,6 +464,13 @@ static void htc_leo_init(MachineState *machine)
         exit(EXIT_FAILURE);
     }
 
+    if (s->pin_cpu) {
+        leo_pin_fast_cpus();        /* before the vCPU thread exists */
+    }
+    if (s->hostlink) {
+        leo_hostlink_open(s->hostlink, &error_fatal);
+    }
+
     s->cpu = ARM_CPU(cpu_create(machine->cpu_type));
 
     /* memory */
@@ -726,9 +735,40 @@ static void leo_set_reboot_file(Object *obj, const char *v, Error **errp)
     s->reboot_file = *v ? g_strdup(v) : NULL;
 }
 
+static char *leo_get_hostlink(Object *obj, Error **errp)
+{
+    return g_strdup(HTC_LEO_MACHINE(obj)->hostlink ?: "");
+}
+
+static void leo_set_hostlink(Object *obj, const char *v, Error **errp)
+{
+    HtcLeoMachineState *s = HTC_LEO_MACHINE(obj);
+    g_free(s->hostlink);
+    s->hostlink = *v ? g_strdup(v) : NULL;
+}
+
+static bool leo_get_pin_cpu(Object *obj, Error **errp)
+{
+    return HTC_LEO_MACHINE(obj)->pin_cpu;
+}
+
+static void leo_set_pin_cpu(Object *obj, bool v, Error **errp)
+{
+    HTC_LEO_MACHINE(obj)->pin_cpu = v;
+}
+
 static void htc_leo_class_init(ObjectClass *oc, const void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
+    object_class_property_add_str(oc, "hostlink", leo_get_hostlink,
+                                  leo_set_hostlink);
+    object_class_property_set_description(oc, "hostlink",
+        "shared memory file carrying the screen and sound to a front end");
+    object_class_property_add_bool(oc, "pin-cpu", leo_get_pin_cpu,
+                                   leo_set_pin_cpu);
+    object_class_property_set_description(oc, "pin-cpu",
+        "keep the emulator on the host's fastest CPU cores");
 
     object_class_property_add_str(oc, "reboot-file", leo_get_reboot_file,
                                   leo_set_reboot_file);

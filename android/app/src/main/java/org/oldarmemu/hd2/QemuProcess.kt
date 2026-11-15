@@ -37,18 +37,19 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
 
     fun start(boot: Boot, nandMb: Int = 512) {
         rebootFile.delete()
-        st.vncSocket.delete()
+        st.hostlink.delete()
         st.qmpSocket.delete()
         val args = mutableListOf(
             binary.absolutePath,
             "-L", dataDir().absolutePath,
             "-M", "htc-leo,nand-size=$nandMb,reboot-file=${rebootFile.absolutePath}" +
+                ",hostlink=${st.hostlink.absolutePath},pin-cpu=on" +
                 if (boot == Boot.RECOVERY && !st.recovery.exists()) ",boot-mode=recovery" else "",
-            "-accel", "tcg,tb-size=128",
+            "-accel", "tcg,tb-size=256",
             "-nodefaults",
             "-drive", "if=mtd,format=raw,file=${st.nand.absolutePath}",
             "-drive", "if=sd,format=raw,file=${st.sdImage.absolutePath}",
-            "-display", "vnc=unix:${st.vncSocket.absolutePath}",
+            "-display", "none",
             "-qmp", "unix:${st.qmpSocket.absolutePath},server=on,wait=off",
             "-serial", "file:${st.console.absolutePath}",
             "-monitor", "none",
@@ -72,6 +73,13 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
             if (!it.waitFor(2, java.util.concurrent.TimeUnit.SECONDS)) it.destroyForcibly()
         }
         process = null
+    }
+
+    /** Block until the current QEMU process ends; false if there is none. */
+    fun waitFor(): Boolean {
+        val p = process ?: return false
+        p.waitFor()
+        return true
     }
 
     fun waitExit(ms: Long) {

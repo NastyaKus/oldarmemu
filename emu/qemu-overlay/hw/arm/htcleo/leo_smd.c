@@ -22,6 +22,7 @@
 #include "qemu/cutils.h"
 #include "hw/irq.h"
 #include "system/rtc.h"
+#include "system/address-spaces.h"
 #include "msm_a9.h"
 
 /* SMEM item ids (CONFIG_MSM_N_WAY_SMD numbering) */
@@ -77,8 +78,11 @@ enum {
 #define ADSP_AUDIO_EVT_STATUS_CLOSE     0x0108c0d7
 #define ADSP_AUDIO_EVT_STATUS_BUF_DONE  0x0108c0d8
 
-/* assumed PCM format when pacing buffers: 44.1 kHz, stereo, s16 */
-#define PCM_BYTES_PER_SEC   (44100 * 4)
+/* PCM format when the OPEN command did not say: 44.1 kHz, stereo, s16 */
+#define PCM_DEFAULT_RATE    44100
+#define PCM_DEFAULT_CH      2
+#define ADSP_AUDIO_FORMAT_PCM           0x0103d2fd
+#define ADSP_AUDIO_OPCODE_OPEN_WRITE    0x02
 
 /*
  * The kernel names a channel "SMD_<name>" (type APPS_MODEM) or
@@ -480,17 +484,62 @@ static void audio_ddi(MsmA9State *s, int ci, uint32_t ddi,
         }
         break;
     case AUDIO_OP_OPEN:
+        /*
+         * [ilen] hdr{context,data} opcode numdev dev[4] stream_context
+         * format pblock blocklen ...; pblock -> adsp_audio_standard_format
+         * { u16 channels, u16 bits, u32 rate, ... } in guest memory
+         */
+        cl->rate = PCM_DEFAULT_RATE;
+        cl->channels = PCM_DEFAULT_CH;
+        cl->playback = false;
+        if (len >= 4 + 8 + 40) {
+            uint32_t opcode = ldl_le_p(p + 12);
+            uint32_t format = ldl_le_p(p + 40);
+            uint32_t pblock = ldl_le_p(p + 44);
+            uint8_t fmt[8];
+
+            if (format == ADSP_AUDIO_FORMAT_PCM && pblock &&
+                address_space_read(&address_space_memory, pblock,
+                                   MEMTXATTRS_UNSPECIFIED, fmt, 8) == MEMTX_OK &&
+                lduw_le_p(fmt) >= 1 && lduw_le_p(fmt) <= 2 &&
+                lduw_le_p(fmt + 2) == 16 && ldl_le_p(fmt + 4) >= 8000 &&
+                ldl_le_p(fmt + 4) <= 48000) {
+                cl->channels = lduw_le_p(fmt);
+                cl->rate = ldl_le_p(fmt + 4);
+            }
+            cl->playback = opcode == ADSP_AUDIO_OPCODE_OPEN_WRITE &&
+                           format == ADSP_AUDIO_FORMAT_PCM;
+            if (cl->playback) {
+                leo_hostlink_audio_format(cl->rate, cl->channels);
+            }
+        }
         queue_event(s, ci, ADSP_AUDIO_EVT_STATUS_OPEN, now + 1000000);
         break;
     case AUDIO_OP_WRITE:
     case AUDIO_OP_READ: {
-        /* [ilen] hdr{context,data} buffer{addr,max_size,actual_size} */
+        /*
+         * [ilen] hdr{context,data} buffer{addr,max_size,actual_size,
+         * offset,...}
+         */
         uint32_t bytes = len >= 24 ? ldl_le_p(p + 4 + 8 + 8) : 0;
         if (ddi == AUDIO_OP_READ && len >= 24) {
             bytes = ldl_le_p(p + 4 + 8 + 4);
         }
+        if (ddi == AUDIO_OP_WRITE && cl->playback && bytes &&
+            bytes <= 256 * 1024 && len >= 4 + 8 + 16) {
+            uint32_t addr = ldl_le_p(p + 12) + ldl_le_p(p + 24);
+            g_autofree uint8_t *pcm = g_malloc(bytes);
+
+            if (address_space_read(&address_space_memory, addr,
+                                   MEMTXATTRS_UNSPECIFIED, pcm,
+                                   bytes) == MEMTX_OK) {
+                leo_hostlink_audio_write(pcm, bytes);
+            }
+        }
+        uint32_t bps = (cl->rate ? cl->rate : PCM_DEFAULT_RATE) * 2 *
+                       (cl->channels ? cl->channels : PCM_DEFAULT_CH);
         int64_t dur = muldiv64(bytes ? bytes : 4096, NANOSECONDS_PER_SECOND,
-                               PCM_BYTES_PER_SEC);
+                               bps);
         cl->busy_until = MAX(cl->busy_until, now) + dur;
         queue_event(s, ci, ADSP_AUDIO_EVT_STATUS_BUF_DONE, cl->busy_until);
         break;

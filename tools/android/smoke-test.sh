@@ -14,13 +14,22 @@ touch "$D/nand.img"
 SD="${2:-}"
 [ -n "$SD" ] || { truncate -s 1G "$D/sd.img"; SD="$D/sd.img"; }
 cd "$D"
-TMPDIR="$D" timeout 40 ./libqemu-leo.so -L "$D/qemu-data" \
-    -M htc-leo,nand-size=512 -accel tcg,tb-size=128 -nodefaults \
+TMPDIR="$D" timeout 90 ./libqemu-leo.so -L "$D/qemu-data" \
+    -M htc-leo,nand-size=512,reboot-file="$D/reboot.txt",hostlink="$D/hostlink.shm",pin-cpu=on \
+    -accel tcg,tb-size=256 -nodefaults \
     -drive if=mtd,format=raw,file="$D/nand.img" -drive if=sd,format=raw,file="$SD" \
-    -display vnc=unix:"$D/vnc.sock" -qmp unix:"$D/qmp.sock",server=on,wait=off \
+    -display none -qmp unix:"$D/qmp.sock",server=on,wait=off \
     -serial file:"$D/console.log" -monitor none -kernel "$1" > qemu.log 2>&1 &
-sleep 20
-if [ -S "$D/vnc.sock" ] && grep -q 'Freeing init memory' "$D/console.log"; then
+sleep 40
+# the recovery menu must reach the shared frame buffer, and a key sent
+# over QMP must change it
+SEQ() { python3 -c 'import struct,sys;d=open(sys.argv[1],"rb").read(24);print(struct.unpack_from("<6I",d)[4] if d[:4]==b"HD2L" and struct.unpack_from("<6I",d)[5] else -1)' "$D/hostlink.shm"; }
+S1=$(SEQ)
+python3 "$ROOT/tools/leoctl.py" "$D/qmp.sock" key voldown >/dev/null
+sleep 2
+S2=$(SEQ)
+echo "frames: $S1 -> $S2"
+if [ "$S1" -gt 0 ] && [ "$S2" -gt "$S1" ] && grep -q 'Freeing init memory' "$D/console.log"; then
     echo "smoke test OK ($D)"
 else
     echo "smoke test FAILED:"; cat qemu.log; tail -5 console.log 2>/dev/null; exit 1
