@@ -421,6 +421,9 @@ static void htc_leo_init(MachineState *machine)
     memory_region_init_ram(&s->smi, NULL, "leo.smi", MSM_SMI_SIZE, &error_fatal);
     memory_region_add_subregion(sysmem, MSM_SMI_BASE, &s->smi);
     memory_region_add_subregion(sysmem, MSM_EBI1_BASE, machine->ram);
+    leo_quirks_set_ram((uint8_t *)memory_region_get_ram_ptr(machine->ram) +
+                       (LEO_KERNEL_BASE - MSM_EBI1_BASE),
+                       machine->ram_size - (LEO_KERNEL_BASE - MSM_EBI1_BASE));
 
     /* interrupt controller */
     s->vic = qdev_new(TYPE_MSM_VIC);
@@ -453,6 +456,8 @@ static void htc_leo_init(MachineState *machine)
         qdev_connect_gpio_out_named(s->csr, "a2m", i,
                                     qdev_get_gpio_in_named(s->a9, "a2m", i));
     }
+    qdev_connect_gpio_out_named(s->vic, "wake-req", 0,
+                                qdev_get_gpio_in_named(s->a9, "wake", 0));
 
     /* secondary interrupt controller, cascaded into the VIC */
     s->sirc = qdev_new(TYPE_MSM_SIRC);

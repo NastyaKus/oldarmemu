@@ -52,6 +52,7 @@ struct MsmVicState {
     MemoryRegion iomem;
     qemu_irq irq;
     qemu_irq fiq;
+    qemu_irq wake_req;      /* to the fake modem: apps needs waking */
 
     uint32_t select[2];
     uint32_t enable[2];
@@ -103,12 +104,32 @@ static void vic_update(MsmVicState *s)
     qemu_set_irq(s->fiq, fiq && (s->masteren & 2));
 }
 
+/*
+ * In deep sleep HD2 kernels mask everything but INT_A9_M2A_6 and let the
+ * modem watch the wake-up sources.  Tell our fake modem when one of them
+ * fires while the apps CPU waits like that.
+ */
+static bool vic_apps_in_modem_sleep(MsmVicState *s)
+{
+    return s->enable[0] == (1u << INT_A9_M2A_6) && s->enable[1] == 0;
+}
+
+static bool vic_is_wake_source(int n)
+{
+    return n == INT_SIRC_0 || n == INT_SIRC_1 || n == INT_GP_TIMER_EXP ||
+           n == INT_DEBUG_TIMER_EXP || n == INT_SDC2_0;
+}
+
 static void vic_set_irq(void *opaque, int n, int level)
 {
     MsmVicState *s = opaque;
     int b = n >> 5;
     uint32_t m = 1u << (n & 31);
     bool old = s->level[b] & m;
+
+    if (level && !old && vic_is_wake_source(n) && vic_apps_in_modem_sleep(s)) {
+        qemu_irq_pulse(s->wake_req);
+    }
 
     if (level) {
         s->level[b] |= m;
@@ -236,6 +257,8 @@ static void vic_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         break;
     case VIC_INT_MASTEREN:
         s->masteren = val;
+        /* the kernel has just initialised its interrupt layer */
+        leo_apply_kernel_quirks();
         break;
     case VIC_CONFIG:
         s->config = val;
@@ -279,6 +302,7 @@ static void vic_reset(DeviceState *dev)
     memset(&s->select, 0, sizeof(*s) - offsetof(MsmVicState, select));
     s->level[0] = lvl0;
     s->level[1] = lvl1;
+    leo_reset_kernel_quirks();
     s->no_pend_val = 0xffffffff;
     s->no_pend_val_fiq = 0xffffffff;
     s->last_irq = 0xffffffff;
@@ -294,6 +318,7 @@ static void vic_init(Object *obj)
     sysbus_init_irq(sbd, &s->irq);
     sysbus_init_irq(sbd, &s->fiq);
     qdev_init_gpio_in(DEVICE(obj), vic_set_irq, MSM_VIC_NUM_IRQS);
+    qdev_init_gpio_out_named(DEVICE(obj), &s->wake_req, "wake-req", 1);
 }
 
 static const VMStateDescription vmstate_msm_vic = {

@@ -83,7 +83,7 @@
 #define MSM_GPIO_NUM            165
 
 /* number of apps->modem doorbells in the CSR block */
-#define MSM_A2M_NUM             8
+#define MSM_A2M_NUM             16
 
 /* ---- device type names ---- */
 #define TYPE_MSM_VIC    "msm-vic"
@@ -111,6 +111,12 @@ void msm_gpio_set_default(DeviceState *dev, int n, bool level);
 /* NAND page as Linux sees it: 2048 data bytes + 16 free OOB bytes. */
 bool msm_nand_read_page(DeviceState *dev, uint32_t page, uint8_t *data,
                         uint8_t *oob);
+
+/* Kernel fix-ups for emulation, see leo_quirks.c */
+void leo_apply_kernel_quirks(void);
+void leo_reset_kernel_quirks(void);
+void leo_quirks_set_ram(void *host, uint64_t size);
+bool leo_quirk_rename_smd_channel(const char *from, const char *to);
 
 /* Press/release an HD2 hardware button (index, see htc_leo.c). */
 void leo_set_key(int key, bool down);

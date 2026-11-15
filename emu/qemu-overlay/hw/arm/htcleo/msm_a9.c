@@ -29,7 +29,7 @@
 #include "migration/vmstate.h"
 #include "msm.h"
 
-OBJECT_DECLARE_SIMPLE_TYPE(MsmA9State, MSM_A9)
+#include "msm_a9.h"
 
 /* ---- SMEM layout (smd_private.h) ---- */
 #define SMEM_HEAP_INFO_OFF      0x0C0
@@ -80,6 +80,24 @@ enum {
 #define SMSM_RUN                0x00000100
 #define SMSM_STATE_APPS         0
 #define SMSM_STATE_MODEM        1
+#define SMSM_STATE_APPS_DEM     3
+#define SMSM_STATE_POWER_MASTER_DEM 6
+
+/* DEM (dynamic environment manager) sleep handshake, pm.c */
+#define DEM_SLAVE_SMSM_RUN          0x0001
+#define DEM_SLAVE_SMSM_PWRC         0x0002
+#define DEM_SLAVE_SMSM_WFPI         0x0010
+#define DEM_SLAVE_SMSM_SLEEP        0x0020
+#define DEM_SLAVE_SMSM_SLEEP_EXIT   0x0040
+#define DEM_SLAVE_SMSM_PWRC_SUSPEND 0x0200
+#define DEM_MASTER_SMSM_RUN         0x01
+#define DEM_MASTER_SMSM_RSA         0x02
+#define DEM_MASTER_SMSM_SLEEP_EXIT  0x08
+#define DEM_MASTER_SMSM_READY       0x10
+#define DEM_MASTER_SMSM_SLEEP       0x20
+#define SMEM_APPS_DEM_SLAVE_DATA    334
+
+#define SMSM_DOORBELL               5
 
 /* ---- standard proc_comm (offset 0 of SMEM) ---- */
 #define PC_APP_COMMAND          0x00
@@ -113,27 +131,8 @@ enum {
 #define DEX_DOORBELL            4
 #define PROC_COMM_DOORBELL      6
 
-struct MsmA9State {
-    SysBusDevice parent_obj;
-    MemoryRegion shared_ram;
-    uint8_t *smem;
-    qemu_irq m2a[7];
-    uint32_t heap_free;
-    uint32_t dex_count;
-};
-
-static inline uint32_t smem_rd(MsmA9State *s, uint32_t off)
-{
-    return ldl_le_p(s->smem + off);
-}
-
-static inline void smem_wr(MsmA9State *s, uint32_t off, uint32_t v)
-{
-    stl_le_p(s->smem + off, v);
-}
-
 /* Pre-allocate an SMEM item the way AMSS would.  Returns its offset. */
-static uint32_t smem_alloc_item(MsmA9State *s, unsigned id, uint32_t size)
+uint32_t smem_alloc_item(MsmA9State *s, unsigned id, uint32_t size)
 {
     uint32_t toc = SMEM_TOC_OFF + id * 16;
 
@@ -236,6 +235,29 @@ static void a9_handle_proc_comm(MsmA9State *s)
     smem_wr(s, PC_APP_COMMAND, PCOM_CMD_DONE);
 }
 
+/*
+ * The apps processor announces sleep/wake transitions in its DEM slave
+ * state; acknowledge them as the power master (modem) would.
+ */
+static void a9_handle_smsm(MsmA9State *s)
+{
+    uint32_t off = smem_rd(s, SMEM_TOC_OFF + SMEM_SMSM_SHARED_STATE * 16 + 4);
+    uint32_t apps = smem_rd(s, off + SMSM_STATE_APPS_DEM * 4);
+    uint32_t master = DEM_MASTER_SMSM_READY;
+
+    if (apps & (DEM_SLAVE_SMSM_PWRC | DEM_SLAVE_SMSM_PWRC_SUSPEND)) {
+        master |= DEM_MASTER_SMSM_RSA;
+    } else if (apps & DEM_SLAVE_SMSM_SLEEP) {
+        master |= DEM_MASTER_SMSM_SLEEP;
+    } else if (apps & DEM_SLAVE_SMSM_SLEEP_EXIT) {
+        master |= DEM_MASTER_SMSM_SLEEP_EXIT | DEM_MASTER_SMSM_RUN;
+    } else {
+        /* RUN, WFPI (wake from power collapse) or anything else */
+        master |= DEM_MASTER_SMSM_RUN;
+    }
+    smem_wr(s, off + SMSM_STATE_POWER_MASTER_DEM * 4, master);
+}
+
 static void a9_doorbell(void *opaque, int n, int level)
 {
     MsmA9State *s = opaque;
@@ -249,6 +271,13 @@ static void a9_doorbell(void *opaque, int n, int level)
         break;
     case PROC_COMM_DOORBELL:
         a9_handle_proc_comm(s);
+        break;
+    case SMSM_DOORBELL:
+        a9_handle_smsm(s);
+        break;
+    case SMD_MODEM_DOORBELL:
+    case SMD_DSP_DOORBELL:
+        a9_smd_kick(s);
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "msm-a9: doorbell %d rung\n", n);
@@ -276,7 +305,12 @@ static void a9_build_smem(MsmA9State *s)
     smem_wr(s, off + SMSM_STATE_MODEM * 4,
             SMSM_INIT | SMSM_SMDINIT | SMSM_RPCINIT | SMSM_RUN);
 
+    smem_wr(s, off + SMSM_STATE_POWER_MASTER_DEM * 4,
+            DEM_MASTER_SMSM_RUN | DEM_MASTER_SMSM_READY);
+
     smem_alloc_item(s, SMEM_SMSM_INT_INFO, 3 * 4);
+    /* struct msm_dem_slave_data: enables idle power collapse */
+    smem_alloc_item(s, SMEM_APPS_DEM_SLAVE_DATA, 52);
     smem_alloc_item(s, SMEM_SMEM_SLOW_CLOCK_VALUE, 4);
     smem_alloc_item(s, SMEM_SMSM_SLEEP_DELAY, 4);
     smem_alloc_item(s, SMEM_SMSM_LIMIT_SLEEP, 4);
@@ -287,11 +321,15 @@ static void a9_build_smem(MsmA9State *s)
 
     /* DEX ready flag */
     smem_wr(s, DEX_BASE + DEX_READY, 1);
+
+    /* SMD channels served by the fake modem/DSP */
+    a9_smd_init(s);
 }
 
 static void a9_reset(DeviceState *dev)
 {
     MsmA9State *s = MSM_A9(dev);
+    a9_smd_reset(s);
     a9_build_smem(s);
     s->dex_count = 0;
 }
@@ -308,14 +346,32 @@ static void a9_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->shared_ram);
 }
 
+/* a wake-up source fired while the apps CPU sleeps: wake it like AMSS */
+static void a9_wake_apps(void *opaque, int n, int level)
+{
+    MsmA9State *s = opaque;
+    uint32_t off;
+
+    if (!level) {
+        return;
+    }
+    off = smem_rd(s, SMEM_TOC_OFF + SMEM_SMSM_SHARED_STATE * 16 + 4);
+    smem_wr(s, off + SMSM_STATE_POWER_MASTER_DEM * 4,
+            DEM_MASTER_SMSM_RUN | DEM_MASTER_SMSM_READY);
+    qemu_irq_pulse(s->m2a[6]);
+}
+
 static void a9_init(Object *obj)
 {
     MsmA9State *s = MSM_A9(obj);
+
+    s->smd_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, a9_smd_timer_cb, s);
 
     for (int i = 0; i < 7; i++) {
         sysbus_init_irq(SYS_BUS_DEVICE(obj), &s->m2a[i]);
     }
     qdev_init_gpio_in_named(DEVICE(obj), a9_doorbell, "a2m", MSM_A2M_NUM);
+    qdev_init_gpio_in_named(DEVICE(obj), a9_wake_apps, "wake", 1);
 }
 
 static const VMStateDescription vmstate_msm_a9 = {
