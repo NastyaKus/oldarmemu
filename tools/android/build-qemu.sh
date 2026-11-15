@@ -50,5 +50,9 @@ if [ "$(strings qemu-system-arm | grep -cx 'htc-leo-machine')" = 0 ]; then
     exit 1
 fi
 cp qemu-system-arm "$OUT/libqemu-leo.so"
+# data files QEMU loads at run time (-L): the VNC keyboard layout
+ASSETS="$ROOT/android/app/src/main/assets/qemu/keymaps"
+mkdir -p "$ASSETS"
+cp "$QEMU_SRC/pc-bios/keymaps/en-us" "$ASSETS/"
 "$TC/bin/llvm-strip" "$OUT/libqemu-leo.so"
 ls -la "$OUT/libqemu-leo.so"

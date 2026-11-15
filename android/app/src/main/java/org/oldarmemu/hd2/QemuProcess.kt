@@ -14,11 +14,24 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
     private val binary: File
         get() = File(ctx.applicationInfo.nativeLibraryDir, "libqemu-leo.so")
 
+    /* data directory for QEMU (-L): files bundled in assets/qemu */
+    private fun dataDir(): File {
+        val dir = File(st.dir, "qemu-data")
+        for (name in listOf("keymaps/en-us")) {
+            val f = File(dir, name)
+            if (f.exists()) continue
+            f.parentFile!!.mkdirs()
+            ctx.assets.open("qemu/$name").use { i -> f.outputStream().use { i.copyTo(it) } }
+        }
+        return dir
+    }
+
     fun start(boot: Boot, nandMb: Int = 512) {
         st.vncSocket.delete()
         st.qmpSocket.delete()
         val args = mutableListOf(
             binary.absolutePath,
+            "-L", dataDir().absolutePath,
             "-M", "htc-leo,nand-size=$nandMb" +
                 if (boot == Boot.RECOVERY && !st.recovery.exists()) ",boot-mode=recovery" else "",
             "-accel", "tcg,tb-size=128",
