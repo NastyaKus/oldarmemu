@@ -44,6 +44,11 @@ if [ ! -f build.ninja ]; then
         --without-default-devices --audio-drv-list=
 fi
 ninja qemu-system-arm
+# --without-default-devices silently drops boards: make sure ours is in
+if ! strings qemu-system-arm | grep -qx 'htc-leo'; then
+    echo "error: htc-leo machine missing from the Android build" >&2
+    exit 1
+fi
 cp qemu-system-arm "$OUT/libqemu-leo.so"
 "$TC/bin/llvm-strip" "$OUT/libqemu-leo.so"
 ls -la "$OUT/libqemu-leo.so"

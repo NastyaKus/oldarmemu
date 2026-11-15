@@ -1,8 +1,19 @@
+diff --git a/configs/devices/arm-softmmu/default.mak b/configs/devices/arm-softmmu/default.mak
+index 57ef1b8..756d573 100644
+--- a/configs/devices/arm-softmmu/default.mak
++++ b/configs/devices/arm-softmmu/default.mak
+@@ -42,3 +42,6 @@
+ # CONFIG_FSL_IMX7=n
+ # CONFIG_FSL_IMX6UL=n
+ # CONFIG_ALLWINNER_H3=n
++
++# HTC HD2 (Leo); the Android build uses --without-default-devices
++CONFIG_HTC_LEO=y
 diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
-index 2aa4b5d..0f2e6e7 100644
+index 2aa4b5d..4c2d98b 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -692,3 +692,8 @@ config ARMSSE
+@@ -692,3 +692,10 @@ config ARMSSE
      select UNIMP
      select SSE_COUNTER
      select SSE_TIMER
@@ -11,6 +22,8 @@ index 2aa4b5d..0f2e6e7 100644
 +    bool
 +    default y
 +    depends on TCG && ARM
++    select I2C
++    select SD
 diff --git a/hw/arm/boot.c b/hw/arm/boot.c
 index d391cd0..f1917b1 100644
 --- a/hw/arm/boot.c
