@@ -12,8 +12,11 @@
 | Data mover (ADM), NAND (raw 2112-byte pages, cLK partition ATAG) | done |
 | MDP 3.1 + LCDC display (480x800, RGB565/XRGB8888) | done |
 | SDCC (microSD) | todo |
+| Android boot.img as -kernel (HLE cLK) | done |
 | cLK boot from NAND | todo |
 | Android app | todo |
 
 Reference kernel: tytung htcleo 2.6.32 completes all driver init in ~2 s and
 stops at mounting the root fs (no ROM attached yet).
+
+Verified: unmodified CWM 5.0.2.6 for leo (recovery_leo.img) boots to its menu.

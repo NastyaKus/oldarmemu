@@ -29,6 +29,7 @@
 #include "target/arm/cpu-qom.h"
 #include "cpu.h"
 #include "msm.h"
+#include "leo_boot.h"
 
 #define HTCLEO_MACH_ID          2524
 #define LEO_EBI1_DEFAULT_SIZE   (512 * MiB)
@@ -440,12 +441,25 @@ static void htc_leo_init(MachineState *machine)
         exit(EXIT_FAILURE);
     }
 
+    /* -kernel may be an Android boot image (boot.img / recovery.img) */
+    {
+        g_autofree uint8_t *img = NULL;
+        gsize len = 0;
+
+        if (g_file_get_contents(machine->kernel_filename, (gchar **)&img,
+                                &len, NULL) &&
+            leo_is_android_bootimg(img, len)) {
+            leo_use_android_bootimg(machine, img, len, &error_fatal);
+        }
+    }
+
     leo_binfo.loader_start = LEO_KERNEL_BASE;
     leo_binfo.ram_size = machine->ram_size - (LEO_KERNEL_BASE - MSM_EBI1_BASE);
     leo_binfo.board_id = HTCLEO_MACH_ID;
     leo_binfo.atag_board = leo_atag_board;
     leo_binfo.atag_board_raw = true;
     arm_load_kernel(s->cpu, machine, &leo_binfo);
+    leo_cleanup_tmp(machine);
 }
 
 static void leo_get_nand_size(Object *obj, Visitor *v, const char *name,
