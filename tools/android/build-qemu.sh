@@ -45,7 +45,7 @@ if [ ! -f build.ninja ]; then
 fi
 ninja qemu-system-arm
 # --without-default-devices silently drops boards: make sure ours is in
-if ! strings qemu-system-arm | grep -qx 'htc-leo-machine'; then
+if [ "$(strings qemu-system-arm | grep -cx 'htc-leo-machine')" = 0 ]; then
     echo "error: htc-leo machine missing from the Android build" >&2
     exit 1
 fi
