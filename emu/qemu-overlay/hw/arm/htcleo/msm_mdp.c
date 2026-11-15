@@ -353,7 +353,23 @@ static void mdp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         return;
     case MDP_DMA_P_CONFIG:      s->dma_p_config = val; return;
     case MDP_DMA_P_SIZE:        s->dma_p_size = val; return;
-    case MDP_DMA_P_IBUF_ADDR:   s->dma_p_ibuf = val; return;
+    case MDP_DMA_P_IBUF_ADDR:
+        s->dma_p_ibuf = val;
+        /*
+         * msm_fb points DMA_P at the new buffer and then sleeps until the
+         * next LCDC frame start.  Our "panel" has nothing to scan out at a
+         * fixed rate, so show the frame right away instead of making every
+         * eglSwapBuffers wait up to 16.7 ms (which also quantised the frame
+         * rate to 60/30/20/15).  1 ms leaves time to enable the interrupt.
+         */
+        if (s->lcdc_en & 1) {
+            int64_t soon = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS;
+            int64_t due = timer_expire_time_ns(s->vsync);
+            if (due < 0 || due > soon) {
+                timer_mod(s->vsync, soon);
+            }
+        }
+        return;
     case MDP_DMA_P_IBUF_Y_STRIDE: s->dma_p_stride = val; return;
     case MDP_LCDC_EN:
         s->lcdc_en = val;

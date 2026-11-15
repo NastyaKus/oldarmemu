@@ -67,6 +67,25 @@ index a2e22bd..351d2df 100644
      /* multicore boards that use the default secondary core boot functions
       * can ignore these two function calls. If the default functions won't
       * work, then write_secondary_boot() should write a suitable blob of
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index 518c0c1..b070d74 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -354,6 +354,14 @@ static void dacr_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
+ {
+     ARMCPU *cpu = env_archcpu(env);
+ 
++    /*
++     * Linux 2.6 rewrites DACR on every thread switch, almost always with
++     * the value it already has; a TLB flush (which also empties the TB
++     * jump cache) each time made Android ~1.45x slower.
++     */
++    if (raw_read(env, ri) == value) {
++        return;
++    }
+     raw_write(env, ri, value);
+     tlb_flush(CPU(cpu)); /* Flush TLB as domain not tracked in TLB */
+ }
 diff --git a/target/arm/tcg/cpu32.c b/target/arm/tcg/cpu32.c
 index a2a23ea..1b1e1a1 100644
 --- a/target/arm/tcg/cpu32.c
