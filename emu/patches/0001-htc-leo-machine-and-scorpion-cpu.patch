@@ -1,0 +1,100 @@
+diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
+index 2aa4b5d..0f2e6e7 100644
+--- a/hw/arm/Kconfig
++++ b/hw/arm/Kconfig
+@@ -692,3 +692,8 @@ config ARMSSE
+     select UNIMP
+     select SSE_COUNTER
+     select SSE_TIMER
++
++config HTC_LEO
++    bool
++    default y
++    depends on TCG && ARM
+diff --git a/hw/arm/meson.build b/hw/arm/meson.build
+index dc68391..851132a 100644
+--- a/hw/arm/meson.build
++++ b/hw/arm/meson.build
+@@ -81,6 +81,8 @@ arm_common_ss.add(when: 'CONFIG_SX1', if_true: files('omap_sx1.c'))
+ arm_common_ss.add(when: 'CONFIG_VERSATILE', if_true: files('versatilepb.c'))
+ arm_common_ss.add(when: 'CONFIG_VEXPRESS', if_true: files('vexpress.c'))
+ 
++subdir('htcleo')
++
+ arm_common_ss.add(files('boot.c'))
+ 
+ hw_arch += {'arm': arm_ss}
+diff --git a/target/arm/tcg/cpu32.c b/target/arm/tcg/cpu32.c
+index a2a23ea..1b1e1a1 100644
+--- a/target/arm/tcg/cpu32.c
++++ b/target/arm/tcg/cpu32.c
+@@ -380,6 +380,61 @@ static void cortex_a8_initfn(Object *obj)
+     define_arm_cp_regs(cpu, cortexa8_cp_reginfo);
+ }
+ 
++/*
++ * Qualcomm Scorpion (QSD8x50).  ARMv7-A with VFPv3 + NEON, close to
++ * Cortex-A8 from software's point of view, but with its own MIDR and a
++ * set of implementation-defined cache/power registers in c9 and c15.
++ */
++static const ARMCPRegInfo scorpion_cp_reginfo[] = {
++    /* cache maintenance/lockdown/victim registers: c9, c0/c1 */
++    { .name = "SCORPION_C9_0", .cp = 15, .crn = 9, .crm = 0,
++      .opc1 = CP_ANY, .opc2 = CP_ANY, .access = PL1_RW, .type = ARM_CP_CONST,
++      .resetvalue = 0 },
++    { .name = "SCORPION_C9_1", .cp = 15, .crn = 9, .crm = 1,
++      .opc1 = CP_ANY, .opc2 = CP_ANY, .access = PL1_RW, .type = ARM_CP_CONST,
++      .resetvalue = 0 },
++};
++
++static void scorpion_initfn(Object *obj)
++{
++    ARMCPU *cpu = ARM_CPU(obj);
++    ARMISARegisters *isar = &cpu->isar;
++
++    cpu->dtb_compatible = "qcom,scorpion";
++    set_feature(&cpu->env, ARM_FEATURE_V7);
++    set_feature(&cpu->env, ARM_FEATURE_NEON);
++    set_feature(&cpu->env, ARM_FEATURE_THUMB2EE);
++    set_feature(&cpu->env, ARM_FEATURE_DUMMY_C15_REGS);
++    set_feature(&cpu->env, ARM_FEATURE_PMU);
++    cpu->midr = 0x510f00f2;          /* Qualcomm Scorpion r0p2 */
++    cpu->reset_fpsid = 0x510f0010;   /* VFPv3, implementer Qualcomm */
++    cpu->isar.mvfr0 = 0x11110222;
++    cpu->isar.mvfr1 = 0x00011111;
++    cpu->ctr = 0x83338003;
++    cpu->reset_sctlr = 0x00c50078;
++    SET_IDREG(isar, ID_PFR0, 0x1031);
++    SET_IDREG(isar, ID_PFR1, 0x00);
++    SET_IDREG(isar, ID_DFR0, 0x400);
++    SET_IDREG(isar, ID_AFR0, 0);
++    SET_IDREG(isar, ID_MMFR0, 0x31100003);
++    SET_IDREG(isar, ID_MMFR1, 0x20000000);
++    SET_IDREG(isar, ID_MMFR2, 0x01202000);
++    SET_IDREG(isar, ID_MMFR3, 0x11);
++    SET_IDREG(isar, ID_ISAR0, 0x00101111);
++    SET_IDREG(isar, ID_ISAR1, 0x12112111);
++    SET_IDREG(isar, ID_ISAR2, 0x21232031);
++    SET_IDREG(isar, ID_ISAR3, 0x11112131);
++    SET_IDREG(isar, ID_ISAR4, 0x00111142);
++    cpu->isar.dbgdidr = 0x15141000;
++    SET_IDREG(isar, CLIDR, (1 << 27) | (2 << 24) | (4 << 3) | 3);
++    cpu->ccsidr[0] = 0xe007e01a; /* 32k L1 dcache */
++    cpu->ccsidr[1] = 0x2007e01a; /* 32k L1 icache */
++    cpu->ccsidr[2] = 0xf03fe03a; /* 256k L2 */
++    cpu->reset_auxcr = 0;
++    cpu->isar.reset_pmcr_el0 = 0x51002000;
++    define_arm_cp_regs(cpu, scorpion_cp_reginfo);
++}
++
+ static const ARMCPRegInfo cortexa9_cp_reginfo[] = {
+     /*
+      * power_control should be set to maximum latency. Again,
+@@ -1024,6 +1079,7 @@ static const ARMCPUInfo arm_tcg_cpus[] = {
+     { .name = "arm11mpcore", .initfn = arm11mpcore_initfn },
+     { .name = "cortex-a7",   .initfn = cortex_a7_initfn },
+     { .name = "cortex-a8",   .initfn = cortex_a8_initfn },
++    { .name = "scorpion",    .initfn = scorpion_initfn },
+     { .name = "cortex-a9",   .initfn = cortex_a9_initfn },
+     { .name = "cortex-a15",  .initfn = cortex_a15_initfn },
+     { .name = "cortex-r5",   .initfn = cortex_r5_initfn },
