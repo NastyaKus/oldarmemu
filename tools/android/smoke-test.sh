@@ -15,7 +15,7 @@ SD="${2:-}"
 [ -n "$SD" ] || { truncate -s 1G "$D/sd.img"; SD="$D/sd.img"; }
 cd "$D"
 TMPDIR="$D" timeout 90 ./libqemu-leo.so -L "$D/qemu-data" \
-    -M htc-leo,nand-size=512,reboot-file="$D/reboot.txt",hostlink="$D/hostlink.shm",pin-cpu=on \
+    -M htc-leo,nand-size=1024,system-size=300,cache-size=44,reboot-file="$D/reboot.txt",hostlink="$D/hostlink.shm",pin-cpu=on \
     -accel tcg,tb-size=256 -nodefaults \
     -drive if=mtd,format=raw,file="$D/nand.img" -drive if=sd,format=raw,file="$SD" \
     -display none -qmp unix:"$D/qmp.sock",server=on,wait=off \
