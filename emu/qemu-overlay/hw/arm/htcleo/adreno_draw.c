@@ -925,19 +925,20 @@ typedef struct PVtx {
 
 /*
  * Pixel shader fast path.  The program is executed once symbolically per
- * draw; every register component is tracked as a * T[k] + b, T being the
- * (single) texture fetch result, or as a constant.  Composition shaders
- * (texture copy, modulate by a constant, solid fill) reduce to such a
- * formula and are then evaluated per pixel without the interpreter.
+ * draw; every register component is tracked as b + a * T[k] + c * P[m]:
+ * T the (single) texture fetch result, P the interpolated inputs (m =
+ * reg * 4 + comp).  Branches on boolean constants are resolved on the
+ * way.  Composition shaders (texture copy, modulate by a constant, text,
+ * solid fill) reduce to such a formula and are evaluated per pixel
+ * without the interpreter.
  */
+#define SYM_NONE    (-1)
 #define SYM_BAD     (-2)
-#define SYM_CONST   (-1)
-#define SYM_PARAM   100             /* + reg * 4 + comp: interpolated input */
 
-typedef struct Sym { float a, b; int k; } Sym;
+typedef struct Sym { float a, b, c; int k, m; } Sym;
 
 typedef struct FastPS {
-    bool ok, has_tex, denorm;
+    bool ok, has_tex, denorm, uses_params;
     uint32_t tcidx, param, uc, vc;
     int mag;
     Sym out[4];
@@ -1155,41 +1156,47 @@ static inline uint8_t *gmem_at(AdrenoState *s, uint32_t off)
 
 static inline Sym sym_c(float b)
 {
-    Sym r = { 0.0f, b, SYM_CONST };
+    Sym r = { 0.0f, b, 0.0f, SYM_NONE, SYM_NONE };
     return r;
 }
 
 static inline Sym sym_bad(void)
 {
-    Sym r = { 0.0f, 0.0f, SYM_BAD };
+    Sym r = { 0.0f, 0.0f, 0.0f, SYM_BAD, SYM_NONE };
     return r;
 }
 
-/* plain value: a constant or an affine function of one texel component */
 static inline bool sym_ok(Sym x)
 {
-    return x.k == SYM_CONST || (x.k >= 0 && x.k < 4);
+    return x.k != SYM_BAD;
+}
+
+static inline bool sym_const(Sym x)
+{
+    return x.k == SYM_NONE && x.m == SYM_NONE;
 }
 
 static Sym sym_add(Sym x, Sym y)
 {
-    if (!sym_ok(x) || !sym_ok(y)) {
+    if (!sym_ok(x) || !sym_ok(y) ||
+        (x.k != SYM_NONE && y.k != SYM_NONE && x.k != y.k) ||
+        (x.m != SYM_NONE && y.m != SYM_NONE && x.m != y.m)) {
         return sym_bad();
     }
-    if (x.k == SYM_CONST) {
-        y.b += x.b;
-        return y;
+    Sym r = { x.a + y.a, x.b + y.b, x.c + y.c,
+              x.k != SYM_NONE ? x.k : y.k, x.m != SYM_NONE ? x.m : y.m };
+    return r;
+}
+
+static Sym sym_scale(Sym x, float f)
+{
+    if (f == 0.0f) {
+        return sym_c(0.0f);
     }
-    if (y.k == SYM_CONST) {
-        x.b += y.b;
-        return x;
-    }
-    if (x.k == y.k) {
-        x.a += y.a;
-        x.b += y.b;
-        return x;
-    }
-    return sym_bad();
+    x.a *= f;
+    x.b *= f;
+    x.c *= f;
+    return x;
 }
 
 static Sym sym_mul(Sym x, Sym y)
@@ -1197,28 +1204,21 @@ static Sym sym_mul(Sym x, Sym y)
     if (!sym_ok(x) || !sym_ok(y)) {
         return sym_bad();
     }
-    if (x.k == SYM_CONST && y.k == SYM_CONST) {
+    if (sym_const(x) && sym_const(y)) {
         return sym_c(mulz(x.b, y.b));
     }
-    if (y.k == SYM_CONST) {
-        Sym t = x;
-        x = y;
-        y = t;
+    if (sym_const(x)) {
+        return sym_scale(y, x.b);
     }
-    if (x.k == SYM_CONST) {
-        if (x.b == 0.0f) {
-            return sym_c(0.0f);
-        }
-        y.a *= x.b;
-        y.b *= x.b;
-        return y;
+    if (sym_const(y)) {
+        return sym_scale(x, y.b);
     }
     return sym_bad();
 }
 
 static inline bool sym_same(Sym x, Sym y)
 {
-    return x.k == y.k && x.a == y.a && x.b == y.b;
+    return x.k == y.k && x.m == y.m && x.a == y.a && x.b == y.b && x.c == y.c;
 }
 
 static Sym sym_minmax(Sym x, Sym y, bool max)
@@ -1229,23 +1229,32 @@ static Sym sym_minmax(Sym x, Sym y, bool max)
     if (sym_same(x, y)) {
         return x;
     }
-    if (x.k == SYM_CONST && y.k == SYM_CONST) {
+    if (sym_const(x) && sym_const(y)) {
         return sym_c(max ? (x.b >= y.b ? x.b : y.b) : (x.b < y.b ? x.b : y.b));
     }
     return sym_bad();
 }
 
+/* x within [lo, hi] for every texel in [0, 1] (unsigned formats) */
+static bool sym_in_range(Sym x, bool unsigned_tex, float lo, float hi)
+{
+    if (x.m != SYM_NONE) {
+        return false;
+    }
+    if (x.k == SYM_NONE) {
+        return x.b >= lo && x.b <= hi;
+    }
+    float e0 = x.b, e1 = x.b + x.a;
+    return unsigned_tex && MIN(e0, e1) >= lo && MAX(e0, e1) <= hi;
+}
+
 static Sym sym_sat(Sym x, bool unsigned_tex)
 {
-    if (x.k == SYM_CONST) {
+    if (sym_const(x)) {
         return sym_c(sat(x.b));
     }
-    /* a * T + b with T in [0, 1] already inside [0, 1] */
-    if (x.k >= 0 && x.k < 4 && unsigned_tex && x.a >= 0 && x.b >= 0 &&
-        x.a + x.b <= 1.0f) {
-        return x;
-    }
-    return sym_bad();
+    return sym_ok(x) && sym_in_range(x, unsigned_tex, 0.0f, 1.0f) ? x
+                                                                   : sym_bad();
 }
 
 static void ps_analyze(AdrenoState *s, DrawState *ds)
@@ -1262,10 +1271,12 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
     ct.stage = ST_PS;
     for (int i = 0; i < 64; i++) {
         for (int c = 0; c < 4; c++) {
-            R[i][c].a = 1.0f;
-            R[i][c].b = 0.0f;
-            R[i][c].k = (uint32_t)i < ds->nparams ? SYM_PARAM + i * 4 + c
-                                                   : SYM_BAD;
+            if ((uint32_t)i < ds->nparams) {
+                Sym p = { 0.0f, 0.0f, 1.0f, SYM_NONE, i * 4 + c };
+                R[i][c] = p;
+            } else {
+                R[i][c] = sym_bad();
+            }
         }
     }
     if (ds->param_gen) {
@@ -1277,18 +1288,49 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
         E[c] = sym_bad();
     }
 
-    for (uint32_t pc = 0; pc < 64; pc++) {
+    for (uint32_t pc = 0, steps = 0; pc < 64 && steps < 128; steps++) {
         uint32_t lo, hi;
         cf_get(prog, pc, &lo, &hi);
         uint64_t cf = lo | ((uint64_t)hi << 32);
         uint32_t opc = (cf >> 44) & 0xf;
+        uint32_t next = pc + 1;
+        bool end = false;
 
-        if (opc == 0 || opc == 12 || opc == 15) {
+        switch (opc) {
+        case 0: case 12: case 15:       /* NOP, ALLOC, MARK_VS_FETCH_DONE */
+            pc = next;
+            continue;
+        case 1: case 2:                 /* EXEC, EXEC_END */
+            break;
+        case 3: case 4: case 13: case 14: {   /* COND_EXEC* on a bool */
+            uint32_t baddr = (cf >> 34) & 0xff;
+            bool cond = (cf >> 42) & 1;
+            if (bool_const(s, baddr) != cond) {
+                if (opc == 4 || opc == 14) {
+                    end = true;
+                    goto finish;
+                }
+                pc = next;
+                continue;
+            }
+            break;
+        }
+        case 11: {                      /* COND_JMP */
+            bool force = (cf >> 13) & 1, predj = (cf >> 14) & 1;
+            bool cond = (cf >> 42) & 1;
+            if (predj) {
+                return;
+            }
+            if (force || bool_const(s, (cf >> 34) & 0xff) == cond) {
+                next = cf & 0x3ff;
+            }
+            pc = next;
             continue;
         }
-        if (opc != 1 && opc != 2) {
-            return;                     /* flow control: interpreter */
+        default:
+            return;                     /* loops, calls, predicates */
         }
+        end = opc == 2 || opc == 4 || opc == 14;
         uint32_t addr = cf & 0x1ff, count = (cf >> 12) & 7;
         uint32_t serial = (cf >> 16) & 0xfff;
         for (uint32_t i = 0; i < count; i++) {
@@ -1308,27 +1350,26 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
                     return;
                 }
                 Sym u = R[src][sswz & 3], v = R[src][(sswz >> 2) & 3];
-                if (u.k < SYM_PARAM || v.k < SYM_PARAM || u.a != 1.0f ||
-                    v.a != 1.0f || u.b != 0.0f || v.b != 0.0f ||
-                    (u.k - SYM_PARAM) / 4 != (v.k - SYM_PARAM) / 4) {
+                if (u.k != SYM_NONE || v.k != SYM_NONE || u.m < 0 ||
+                    v.m < 0 || u.c != 1.0f || v.c != 1.0f || u.b != 0.0f ||
+                    v.b != 0.0f || u.m / 4 != v.m / 4) {
                     return;
                 }
                 f->has_tex = true;
                 f->tcidx = (d0 >> 20) & 0x1f;
                 f->denorm = (d0 >> 25) & 1;
                 f->mag = (d1 >> 12) & 3;
-                f->param = (u.k - SYM_PARAM) / 4;
-                f->uc = (u.k - SYM_PARAM) & 3;
-                f->vc = (v.k - SYM_PARAM) & 3;
+                f->param = u.m / 4;
+                f->uc = u.m & 3;
+                f->vc = v.m & 3;
                 TexInfo ti;
                 tex_info(s, f->tcidx, &ti);
                 unsigned_tex = !ti.sign;
                 for (int c = 0; c < 4; c++) {
                     uint32_t sel = (dswz >> (3 * c)) & 7;
                     if (sel < 4) {
-                        R[dst][c].a = 1.0f;
-                        R[dst][c].b = 0.0f;
-                        R[dst][c].k = sel;
+                        Sym t = { 1.0f, 0.0f, 0.0f, (int)sel, SYM_NONE };
+                        R[dst][c] = t;
                     } else if (sel == 5) {
                         R[dst][c] = sym_c(1.0f);
                     } else if (sel != 7) {
@@ -1376,17 +1417,19 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
                 }
                 for (int j = 0; j < 4; j++) {
                     Sym v = raw[((swz[k] >> (2 * j)) + j) & 3];
-                    if (absv) {
-                        if (v.k == SYM_CONST) {
+                    if (absv && sym_ok(v)) {
+                        if (sym_const(v)) {
                             v.b = fabsf(v.b);
-                        } else if (!(v.k >= 0 && v.k < 4 && unsigned_tex &&
-                                     v.a >= 0 && v.b >= 0)) {
+                        } else if (!sym_in_range(v, unsigned_tex, 0.0f,
+                                                 FLT_MAX)) {
                             v = sym_bad();
                         }
                     }
                     if (neg[k]) {
-                        v.a = -v.a;
-                        v.b = -v.b;
+                        v = sym_scale(v, -1.0f);
+                        if (sym_const(v) && v.b == 0.0f) {
+                            v.b = -0.0f;
+                        }
                     }
                     src[k][j] = v;
                 }
@@ -1412,6 +1455,16 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
                     vr[c] = sym_sat(vr[c], unsigned_tex);
                 }
             }
+            if (vop == 15 || vop == 16) {      /* DOT4 / DOT3 */
+                Sym d = sym_c(0.0f);
+                for (int c = 0; c < (vop == 15 ? 4 : 3); c++) {
+                    d = sym_add(d, sym_mul(src[0][c], src[1][c]));
+                }
+                if (vclamp) {
+                    d = sym_sat(d, unsigned_tex);
+                }
+                vr[0] = vr[1] = vr[2] = vr[3] = d;
+            }
             Sym x = src[2][3], y = src[2][0], p;
             switch (sop) {
             case 0: p = sym_add(x, y); break;
@@ -1421,10 +1474,7 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
             case 5: p = sym_minmax(x, y, true); break;
             case 6: p = sym_minmax(x, y, false); break;
             case 50: p = prev; break;
-            default:
-                p = (x.k == SYM_CONST && y.k == SYM_CONST) || !swm ? sym_bad()
-                                                                 : sym_bad();
-                break;
+            default: p = sym_bad(); break;
             }
             prev = p;
             Sym sr = sclamp ? sym_sat(p, unsigned_tex) : p;
@@ -1460,17 +1510,33 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
                 }
             }
         }
-        if (opc == 2) {
+finish:
+        if (end) {
             for (int c = 0; c < 4; c++) {
                 if (!sym_ok(E[c])) {
                     return;
                 }
                 f->out[c] = E[c];
+                f->uses_params |= E[c].m != SYM_NONE;
             }
             f->ok = true;
             return;
         }
+        pc = next;
     }
+}
+
+/* value of a fast-path output for texel tx and inputs in */
+static inline float sym_eval(const Sym *o, const float *tx, const V4 *in)
+{
+    float v = o->b;
+    if (o->k >= 0) {
+        v += o->a * tx[o->k];
+    }
+    if (o->m >= 0) {
+        v += o->c * in[o->m >> 2].f[o->m & 3];
+    }
+    return v;
 }
 
 static void shade_pixel(DrawState *ds, int x, int y, float z, const V4 *in)
@@ -1524,8 +1590,7 @@ static void shade_pixel(DrawState *ds, int x, int y, float z, const V4 *in)
                        f->denorm, f->mag == 3 ? ti->mag : f->mag, tx);
         }
         for (int c = 0; c < 4; c++) {
-            const Sym *o = &f->out[c];
-            tp->exp[0].f[c] = o->k >= 0 ? o->a * tx[o->k] + o->b : o->b;
+            tp->exp[0].f[c] = sym_eval(&f->out[c], tx, in);
         }
         goto shaded;
     }
@@ -1703,7 +1768,8 @@ static bool fast_span_ok(const DrawState *ds, bool persp)
 {
     bool blend = !((ds->cctl >> 5) & 1) || ((ds->blend >> 29) & 1);
 
-    return ds->fast.ok && !persp && ds->mode == 4 && !(ds->zctl & 6) &&
+    return ds->fast.ok && !ds->fast.uses_params && !persp && ds->mode == 4 &&
+           !(ds->zctl & 6) &&
            !((ds->cctl >> 3) & 1) && ds->samples == 1 && ds->cfmt == 5 &&
            ds->cswap == 0 && ds->cmask == 0xf &&
            (!blend || ds->blend == 0x00010001 || ds->blend == 0x07010701 ||
@@ -1791,8 +1857,7 @@ sample:
             tex_sample(s, ti, u, v, f->denorm, filter, tx);
         }
         for (int i = 0; i < 4; i++) {
-            const Sym *o = &f->out[i];
-            c[i] = o->k >= 0 ? o->a * tx[o->k] + o->b : o->b;
+            c[i] = sym_eval(&f->out[i], tx, NULL);
         }
         if (bmode) {
             float ia = 1.0f - c[3];
@@ -1955,7 +2020,7 @@ static void raster_tri(DrawState *ds, const PVtx *v0, const PVtx *v1,
                     c2 = q2 / qs;
                 }
             }
-            if (ds->fast.ok) {
+            if (ds->fast.ok && !ds->fast.uses_params) {
                 if (ds->fast.has_tex) {
                     uint32_t i = ds->fast.param;
                     for (int k = 0; k < 4; k++) {
