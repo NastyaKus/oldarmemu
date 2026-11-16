@@ -2267,6 +2267,21 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
     ds->sy0 = MAX(MAX(wy0, sy0), 0);
     ds->sx1 = MIN(wx1, sx1);
     ds->sy1 = MIN(wy1, sy1);
+
+    /*
+     * The JB/KK blobs program RB_SURFACE_INFO with the screen pitch (480,
+     * 256) for 128x416 bins, which cannot fit 256 KiB GMEM with that row
+     * stride; the bin is then laid out with the screen scissor's width
+     * (the bin size), like the pitch freedreno and older blobs use.
+     */
+    if (!ds->sysmem) {
+        int bpp = fmt_bpp_rb(ds->cfmt);
+        uint32_t bw = (uint32_t)MAX(sx1 - sx0, 1), bh = (uint32_t)MAX(sy1, 1);
+        if ((uint64_t)ds->pitch * bh * bpp * ds->samples > ADRENO_GMEM_SIZE &&
+            bw < ds->pitch) {
+            ds->pitch = (bw + 31) & ~31u;
+        }
+    }
 }
 
 /* ---------------- entry points ---------------- */
@@ -2300,6 +2315,10 @@ static void dump_state(AdrenoState *s, uint32_t op, const uint32_t *d,
     {
         uint8_t *gp = gmem_at(s, ds->cbase + (200 * ds->pitch + 64) * 4);
         uint32_t pc = s->regs[A2XX_SQ_PS_CONST] & 0x1ff;
+        qemu_log("   screen scissor %08x %08x window %08x %08x woff %08x\n",
+                 s->regs[A2XX_PA_SC_SCREEN_SCISSOR_TL], s->regs[A2XX_PA_SC_SCREEN_SCISSOR_BR],
+                 s->regs[A2XX_PA_SC_WINDOW_SCISSOR_TL], s->regs[A2XX_PA_SC_WINDOW_SCISSOR_BR],
+                 s->regs[A2XX_PA_SC_WINDOW_OFFSET]);
         qemu_log("   cbase %x cinfo %08x zctl %08x zbase %x zfmt %u surf %08x samples %u fast %d/%d\n",
                  ds->cbase, s->regs[A2XX_RB_COLOR_INFO],
                  ds->zctl, ds->zbase, ds->zfmt, s->regs[A2XX_RB_SURFACE_INFO],
