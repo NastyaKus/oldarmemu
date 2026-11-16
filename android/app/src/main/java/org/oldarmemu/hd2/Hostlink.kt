@@ -135,6 +135,11 @@ class QmpInput(private val sock: File) {
         events(sb.toString())
     }
 
+    /** Any QMP command, e.g. {"execute":"system_reset"}. */
+    fun command(json: String) {
+        queue.offer(json + "\n")
+    }
+
     fun key(qcode: String, down: Boolean) {
         events("{\"type\":\"key\",\"data\":{\"down\":$down,\"key\":{\"type\":\"qcode\",\"data\":\"$qcode\"}}}")
     }
@@ -159,7 +164,7 @@ class QmpInput(private val sock: File) {
 }
 
 /** Plays the guest's sound ring through an AudioTrack. */
-class AudioOut(private val link: () -> Hostlink?) {
+class AudioOut(private val latencyMs: Int = 100, private val link: () -> Hostlink?) {
     @Volatile private var running = true
 
     fun start() {
@@ -180,7 +185,7 @@ class AudioOut(private val link: () -> Hostlink?) {
             .setAudioFormat(AudioFormat.Builder()
                 .setSampleRate(rate).setChannelMask(mask)
                 .setEncoding(AudioFormat.ENCODING_PCM_16BIT).build())
-            .setBufferSizeInBytes(maxOf(min * 2, rate * ch * 2 / 10))
+            .setBufferSizeInBytes(maxOf(min * 2, rate * ch * 2 * latencyMs / 1000))
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
             .build().also { it.play() }
@@ -206,8 +211,8 @@ class AudioOut(private val link: () -> Hostlink?) {
                 }
                 var avail = l.audioWritten - rd
                 if (avail < 0 || avail > l.ringBytes) { rd = l.audioWritten; avail = 0 }
-                // never let latency build up past ~250 ms
-                val maxLag = rate * ch * 2 / 4
+                // never let latency build up past ~2.5x the chosen buffer
+                val maxLag = rate * ch * 2 * latencyMs * 5 / 2000
                 if (avail > maxLag) {
                     rd += (avail - maxLag / 2) and 3.inv()
                     avail = l.audioWritten - rd

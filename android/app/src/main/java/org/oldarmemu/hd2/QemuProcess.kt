@@ -37,6 +37,7 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
 
     fun start(boot: Boot) {
         val nl = st.nandLayout()
+        val cfg = Settings(ctx)
         rebootFile.delete()
         st.hostlink.delete()
         st.qmpSocket.delete()
@@ -45,9 +46,9 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
             "-L", dataDir().absolutePath,
             "-M", "htc-leo,nand-size=${nl.sizeMb},system-size=${nl.systemMb}" +
                 ",cache-size=${nl.cacheMb},reboot-file=${rebootFile.absolutePath}" +
-                ",hostlink=${st.hostlink.absolutePath},pin-cpu=on" +
+                ",hostlink=${st.hostlink.absolutePath},pin-cpu=${if (cfg.pinCpu) "on" else "off"}" +
                 if (boot == Boot.RECOVERY && !st.recovery.exists()) ",boot-mode=recovery" else "",
-            "-accel", "tcg,tb-size=256",
+            "-accel", "tcg,tb-size=${cfg.tbSize}",
             "-nodefaults",
             "-drive", "if=mtd,format=raw,file=${st.nand.absolutePath}",
             "-drive", "if=sd,format=raw,file=${st.sdImage.absolutePath}",

@@ -1,207 +1,92 @@
 package org.oldarmemu.hd2
 
-import android.app.Activity
-import android.app.AlertDialog
 import android.content.Intent
-import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-import kotlin.concurrent.thread
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
+import org.oldarmemu.hd2.ui.Actions
+import org.oldarmemu.hd2.ui.App
+import org.oldarmemu.hd2.ui.AppState
+import org.oldarmemu.hd2.ui.Hd2Theme
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Device screen: import a recovery and ROM zips, then boot into recovery
- * (to flash) or into the installed system from NAND - like a real HD2.
+ * (to flash) or into the installed system from NAND, like a real HD2.
  */
-class MainActivity : Activity() {
-    private lateinit var st: Storage
-    private lateinit var info: TextView
+class MainActivity : ComponentActivity() {
+    private lateinit var state: AppState
+
+    private val pickRecovery = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri ?: return@registerForActivityResult
+        state.run("Импорт recovery") { "Recovery импортирован: " + state.st.importRecovery(uri) }
+    }
+
+    private val pickSd = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isEmpty()) return@registerForActivityResult
+        state.run("Копирование на SD-карту") { report ->
+            val names = uris.mapIndexed { i, u ->
+                report(i.toFloat() / uris.size)
+                state.st.addToSdcard(u)
+            }
+            "На SD-карту добавлено: " + names.joinToString()
+        }
+    }
+
+    private val backup = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        uri ?: return@registerForActivityResult
+        state.run("Бэкап NAND") { report ->
+            contentResolver.openOutputStream(uri)!!.use { state.st.backupNand(it) { p -> report(p) } }
+            "Бэкап NAND сохранён."
+        }
+    }
+
+    private val restore = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+        uri ?: return@registerForActivityResult
+        state.run("Восстановление NAND") {
+            contentResolver.openInputStream(uri)!!.use { state.st.restoreNand(it) { } }
+            "NAND восстановлена: ${state.st.nandLayout().label}."
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        st = Storage(this)
-
-        val col = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 32, 32, 32)
+        state = AppState(this)
+        val act = Actions(
+            importRecovery = { pickRecovery.launch(arrayOf("*/*")) },
+            addToSd = { pickSd.launch(arrayOf("*/*")) },
+            backupNand = {
+                val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+                backup.launch("hd2-nand-$stamp.zip")
+            },
+            restoreNand = { restore.launch(arrayOf("application/zip", "*/*")) },
+            shareLogs = { shareLogs() },
+        )
+        setContent {
+            Hd2Theme(state.cfg, state.themeVersion) { App(state, act) }
         }
-        col.addView(TextView(this).apply {
-            text = "HTC HD2 (Leo) — эмулятор"
-            textSize = 22f
-        })
-        info = TextView(this).apply {
-            textSize = 14f
-            setPadding(0, 16, 0, 16)
-        }
-        col.addView(info)
-
-        fun add(label: String, action: () -> Unit) {
-            col.addView(Button(this).apply {
-                text = label
-                isAllCaps = false
-                setOnClickListener { action() }
-            })
-        }
-        add("1. Импорт recovery (CWM/TWRP: .img или .zip)") { pick(REQ_RECOVERY, false) }
-        add("2. Добавить файлы на SD-карту (прошивки, gapps)") { pick(REQ_SDCARD, true) }
-        add("▶ Загрузить Recovery") { launch("recovery") }
-        add("▶ Загрузить Android из NAND") { launch("android") }
-        add("Очистить SD-карту") {
-            confirm("Удалить все файлы с виртуальной SD-карты?") { st.clearSdcard(); refresh() }
-        }
-        add("Стереть NAND (как новый телефон)") {
-            confirm("Стереть всю память NAND? Установленная прошивка пропадёт.") {
-                st.wipeNand(); refresh()
-            }
-        }
-        add("Разметка NAND (размер system, как ppp в cLK)") { chooseLayout() }
-        add("Графика: GPU Adreno / программная") { chooseGraphics() }
-        add("Журнал загрузки ядра") { showLog() }
-        col.addView(TextView(this).apply {
-            textSize = 12f
-            setTextColor(Color.GRAY)
-            setPadding(0, 24, 0, 0)
-            text = HELP
-        })
-        setContentView(ScrollView(this).apply { addView(col) })
-        refresh()
     }
 
     override fun onResume() {
         super.onResume()
-        refresh()
+        state.refresh()
     }
 
-    private fun refresh() {
-        val sd = st.sdcardFiles()
-        val nandMb = st.nand.length() / (1 shl 20)
-        info.text = buildString {
-            append("Recovery: ")
-            append(if (st.recovery.exists()) "есть (${st.recovery.length() / 1024} КБ)" else "нет")
-            append("\nNAND: ")
-            append(if (st.nand.exists() && st.nand.length() > 0) "$nandMb МБ образ" else "пустой")
-            append("\n").append(st.nandLayout().label)
-            append("\nГрафика: ").append(if (st.gpu) "эмуляция GPU Adreno 200" else "программный OpenGL")
-            append("\nSD-карта: ")
-            append(if (sd.isEmpty()) "пусто" else sd.joinToString(", "))
-        }
-    }
-
-    private fun pick(req: Int, multiple: Boolean) {
-        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
-            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, multiple)
-        }
-        startActivityForResult(i, req)
-    }
-
-    @Deprecated("platform API")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        if (resultCode != RESULT_OK || data == null) return
-        val uris = mutableListOf<Uri>()
-        data.clipData?.let { c -> for (k in 0 until c.itemCount) uris += c.getItemAt(k).uri }
-        data.data?.let { if (uris.isEmpty()) uris += it }
-        val wait = AlertDialog.Builder(this).setMessage("Копирование…").setCancelable(false).show()
-        thread {
-            val msg = try {
-                when (requestCode) {
-                    REQ_RECOVERY -> "Recovery импортирован: " + st.importRecovery(uris.first())
-                    else -> "На SD-карту добавлено: " + uris.joinToString { st.addToSdcard(it) }
-                }
-            } catch (e: Exception) {
-                "Ошибка: ${e.message}"
-            }
-            runOnUiThread {
-                wait.dismiss()
-                refresh()
-                AlertDialog.Builder(this).setMessage(msg).setPositiveButton("OK", null).show()
-            }
-        }
-    }
-
-    private fun launch(boot: String) {
-        if (boot == "recovery" && !st.recovery.exists()) {
-            AlertDialog.Builder(this)
-                .setMessage("Сначала импортируйте recovery-образ (например, CWM для leo).")
-                .setPositiveButton("OK", null).show()
-            return
-        }
-        startActivity(Intent(this, EmulatorActivity::class.java).putExtra("boot", boot))
-    }
-
-    private fun chooseLayout() {
-        val cur = st.nandLayout()
-        val items = Storage.LAYOUTS.map { (if (it == cur) "● " else "") + it.label }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setTitle("Разметка NAND")
-            .setItems(items) { _, i ->
-                val l = Storage.LAYOUTS[i]
-                if (l == cur) return@setItems
-                confirm("Новая разметка: ${l.label}.\n\nNAND будет стёрта, прошивку нужно будет " +
-                        "поставить заново (recovery и SD-карта останутся).") {
-                    st.setNandLayout(l); refresh()
-                }
-            }
-            .show()
-    }
-
-    private fun chooseGraphics() {
-        val opts = arrayOf("GPU: эмуляция Adreno 200 (быстрее, OpenGL ES 2.0)",
-                           "Программный OpenGL ES 1.x (совместимость)")
-        AlertDialog.Builder(this)
-            .setTitle("Графика")
-            .setSingleChoiceItems(opts, if (st.gpu) 0 else 1) { d, i ->
-                d.dismiss()
-                thread {
-                    st.gpu = i == 0
-                    runOnUiThread {
-                        refresh()
-                        AlertDialog.Builder(this)
-                            .setMessage(if (st.hasCompatZip())
-                                "zz-hd2emu-compat.zip пересобран. Прошейте его в recovery, " +
-                                "чтобы применить." else
-                                "Добавьте прошивку на SD-карту: zz-hd2emu-compat.zip " +
-                                "появится с этой настройкой.")
-                            .setPositiveButton("OK", null).show()
-                    }
-                }
-            }
-            .show()
-    }
-
-    private fun confirm(text: String, action: () -> Unit) {
-        AlertDialog.Builder(this).setMessage(text)
-            .setPositiveButton("Да") { _, _ -> action() }
-            .setNegativeButton("Нет", null).show()
-    }
-
-    private fun showLog() {
-        val log = (if (st.console.exists()) st.console.readText() else "журнал пуст").takeLast(20000)
-        val tv = TextView(this).apply {
-            text = log
-            textSize = 10f
-            setTextIsSelectable(true)
-            setPadding(16, 16, 16, 16)
-        }
-        AlertDialog.Builder(this).setView(ScrollView(this).apply { addView(tv) })
-            .setPositiveButton("Закрыть", null).show()
-    }
-
-    companion object {
-        const val REQ_RECOVERY = 1
-        const val REQ_SDCARD = 2
-        const val HELP = """Как поставить прошивку, как на настоящий HD2:
-0) для ICS/JB/KK выберите разметку NAND 1024 МБ (system 300–400 МБ), для GB хватит 512/150;
-1) импортируйте recovery для NAND (например recovery_5.0.2.6_leo_CWR.zip);
-2) добавьте zip прошивки на SD-карту (рядом сам появится zz-hd2emu-compat.zip);
-3) «Загрузить Recovery» → install zip from sdcard → прошивка (в AROMA выберите
-   установку в NAND, «system@NAND, data@NAND»), затем zz-hd2emu-compat.zip;
-4) «Загрузить Android из NAND».
-Кнопки HD2: Громк.± — навигация в recovery, «Вызов» — выбор, «Назад» — назад, «Питание» — разбудить экран."""
+    private fun shareLogs() {
+        val f = state.st.logsZip()
+        val uri = FileProvider.getUriForFile(this, "$packageName.files", f)
+        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+            type = "application/zip"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }, "Журналы HD2"))
     }
 }

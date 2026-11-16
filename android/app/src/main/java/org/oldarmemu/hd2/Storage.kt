@@ -4,8 +4,12 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
+import java.util.zip.Deflater
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
 
 /** Files of the (single, for now) emulated HD2. */
@@ -172,13 +176,107 @@ class Storage(private val ctx: Context) {
      */
     fun prepareSdImage() {
         val files = sdcard.listFiles()?.filter { it.isFile }?.sortedBy { it.name } ?: emptyList()
-        val stamp = files.joinToString("\n") { "${it.name}|${it.length()}|${it.lastModified()}" }
+        val sizeMb = Settings(ctx).sdSizeMb
+        val stamp = "size=$sizeMb\n" +
+            files.joinToString("\n") { "${it.name}|${it.length()}|${it.lastModified()}" }
         if (sdImage.exists() && sdStamp.exists() && sdStamp.readText() == stamp) return
-        FatImage.build(sdImage, files)
+        FatImage.build(sdImage, files, sizeMb.toLong() shl 20)
         sdStamp.writeText(stamp)
     }
 
     fun sdcardFiles(): List<String> = sdcard.listFiles()?.map { it.name }?.sorted() ?: emptyList()
+
+    data class SdFile(val name: String, val size: Long, val generated: Boolean)
+
+    fun sdcardEntries(): List<SdFile> =
+        sdcard.listFiles()?.filter { it.isFile }?.sortedBy { it.name.lowercase() }
+            ?.map { SdFile(it.name, it.length(), it.name == COMPAT) } ?: emptyList()
+
+    fun deleteSdFile(name: String) {
+        File(sdcard, name.replace('/', '_')).delete()
+    }
+
+    /** Something was flashed: the NAND image grew beyond the bootloader area. */
+    val nandUsed: Boolean get() = nand.exists() && nand.length() > (8L shl 20)
+
+    /**
+     * Back up the NAND (image + partition layout) as a zip.  Erased flash
+     * compresses to almost nothing, so this is much smaller than the image.
+     */
+    fun backupNand(out: OutputStream, progress: (Float) -> Unit) {
+        nandLayout()
+        ZipOutputStream(out.buffered(1 shl 20)).use { z ->
+            z.setLevel(Deflater.BEST_SPEED)
+            z.putNextEntry(ZipEntry("nand.cfg"))
+            nandCfg.inputStream().use { it.copyTo(z) }
+            z.closeEntry()
+            z.putNextEntry(ZipEntry("nand.img"))
+            val total = nand.length().coerceAtLeast(1)
+            var done = 0L
+            if (nand.exists()) nand.inputStream().use { inp ->
+                val buf = ByteArray(1 shl 20)
+                while (true) {
+                    val n = inp.read(buf)
+                    if (n < 0) break
+                    z.write(buf, 0, n)
+                    done += n
+                    progress(done.toFloat() / total)
+                }
+            }
+            z.closeEntry()
+        }
+    }
+
+    /** Restore a backup made by [backupNand]; the current NAND is replaced. */
+    fun restoreNand(inp: InputStream, progress: (Long) -> Unit) {
+        val tmp = File(dir, "nand.img.restore")
+        var cfg: String? = null
+        var img = false
+        ZipInputStream(inp.buffered(1 shl 20)).use { z ->
+            while (true) {
+                val e = z.nextEntry ?: break
+                when (e.name) {
+                    "nand.cfg" -> cfg = z.readBytes().toString(Charsets.US_ASCII)
+                    "nand.img" -> {
+                        img = true
+                        tmp.outputStream().use { o ->
+                            val buf = ByteArray(1 shl 20)
+                            var done = 0L
+                            while (true) {
+                                val n = z.read(buf)
+                                if (n < 0) break
+                                o.write(buf, 0, n)
+                                done += n
+                                progress(done)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!img || cfg == null) {
+            tmp.delete()
+            throw IllegalArgumentException("это не бэкап NAND эмулятора HD2")
+        }
+        nand.delete()
+        tmp.renameTo(nand)
+        nandCfg.writeText(cfg!!)
+    }
+
+    /** Kernel and emulator logs zipped for sharing. */
+    fun logsZip(): File {
+        val d = File(ctx.cacheDir, "logs").apply { mkdirs() }
+        val out = File(d, "hd2-logs.zip")
+        ZipOutputStream(out.outputStream()).use { z ->
+            for (f in listOf(console, File(dir, "qemu.log"))) {
+                if (!f.exists()) continue
+                z.putNextEntry(ZipEntry(f.name))
+                f.inputStream().use { it.copyTo(z) }
+                z.closeEntry()
+            }
+        }
+        return out
+    }
 
     fun clearSdcard() {
         sdcard.listFiles()?.forEach { it.deleteRecursively() }
