@@ -2277,8 +2277,13 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
     if (!ds->sysmem) {
         int bpp = fmt_bpp_rb(ds->cfmt);
         uint32_t bw = (uint32_t)MAX(sx1 - sx0, 1), bh = (uint32_t)MAX(sy1, 1);
-        if ((uint64_t)ds->pitch * bh * bpp * ds->samples > ADRENO_GMEM_SIZE &&
-            bw < ds->pitch) {
+        /*
+         * ICS does the opposite: 256x246 bins with pitch 128, whose rows
+         * would overlap.  In both cases the bin width is the real stride.
+         */
+        if (ds->samples == 1 &&
+            (((uint64_t)ds->pitch * bh * bpp > ADRENO_GMEM_SIZE && bw < ds->pitch) ||
+             bw > ds->pitch)) {
             ds->pitch = (bw + 31) & ~31u;
         }
     }
