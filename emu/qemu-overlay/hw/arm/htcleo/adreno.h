@@ -93,6 +93,7 @@ uint32_t adreno_rd32(AdrenoState *s, uint32_t va);
 void adreno_wr32(AdrenoState *s, uint32_t va, uint32_t val);
 void adreno_read(AdrenoState *s, uint32_t va, void *buf, uint32_t len);
 uint8_t *adreno_host_page_slow(AdrenoState *s, uint32_t va);
+void adreno_mark_dirty(AdrenoState *s, uint32_t va, uint32_t len);
 
 /* host pointer to the RAM page holding GPU address va, NULL if not RAM */
 static inline uint8_t *adreno_host_page(AdrenoState *s, uint32_t va)

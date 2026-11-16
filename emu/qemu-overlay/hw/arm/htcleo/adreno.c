@@ -241,6 +241,26 @@ uint8_t *adreno_host_page_slow(AdrenoState *s, uint32_t va)
     return p;
 }
 
+/* Mark GPU pages [va, va+len) written through host pointers as dirty. */
+void adreno_mark_dirty(AdrenoState *s, uint32_t va, uint32_t len)
+{
+    uint32_t end = va + len;
+
+    for (va &= ~0xfffu; va < end; va += 4096) {
+        hwaddr pa, xlat, l = 4096;
+        if (!adreno_xlate(s, va, &pa)) {
+            continue;
+        }
+        RCU_READ_LOCK_GUARD();
+        MemoryRegion *mr = address_space_translate(&address_space_memory, pa,
+                                                   &xlat, &l, true,
+                                                   MEMTXATTRS_UNSPECIFIED);
+        if (memory_region_is_ram(mr)) {
+            memory_region_set_dirty(mr, xlat, MIN(l, 4096));
+        }
+    }
+}
+
 uint32_t adreno_rd32(AdrenoState *s, uint32_t va)
 {
     hwaddr pa;

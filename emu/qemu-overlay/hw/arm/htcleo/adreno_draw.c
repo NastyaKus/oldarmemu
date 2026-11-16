@@ -954,6 +954,8 @@ typedef struct DrawState {
     FastPS fast;
     /* render target */
     uint32_t cbase, cfmt, cswap, pitch;
+    bool sysmem, clinear;               /* rendering straight to memory */
+    uint32_t dirty_lo, dirty_hi;        /* memory written, for dirty bits */
     uint32_t samples;                   /* MSAA samples per pixel */
     uint32_t zbase, zfmt;
     uint32_t zctl, cctl, blend, cmask;
@@ -1149,7 +1151,12 @@ static bool compare(uint32_t func, float a, float b)
 
 static inline uint8_t *gmem_at(AdrenoState *s, uint32_t off)
 {
-    return off < ADRENO_GMEM_SIZE ? &s->gmem[off] : NULL;
+    /*
+     * GMEM addresses wrap: JB's SurfaceFlinger sets the surface pitch to
+     * the screen width (480) for 128-wide bins, which only fits because
+     * rows past 256 KiB land in the unused columns of earlier rows.
+     */
+    return &s->gmem[off & (ADRENO_GMEM_SIZE - 1)];
 }
 
 /* ---------------- pixels ---------------- */
@@ -1539,15 +1546,36 @@ static inline float sym_eval(const Sym *o, const float *tx, const V4 *in)
     return v;
 }
 
+/* storage of colour pixel (x, y): GMEM or, for sysmem targets, guest RAM */
+static uint8_t *rt_color(DrawState *ds, int x, int y, int bpp, uint32_t ns)
+{
+    AdrenoState *s = ds->s;
+
+    if (!ds->sysmem) {
+        uint8_t *p = gmem_at(s, ds->cbase + (y * ds->pitch + x) * ns * bpp);
+        return p && p + bpp * ns <= s->gmem + ADRENO_GMEM_SIZE ? p : NULL;
+    }
+    uint32_t off = ds->clinear ? (y * ds->pitch + x) * bpp
+                               : tiled_offset(x, y, ds->pitch, bpp);
+    uint32_t va = ds->cbase + off;
+    uint8_t *hp = adreno_host_page(s, va);
+    if (!hp || (va & 4095) + bpp > 4096) {
+        return NULL;
+    }
+    ds->dirty_lo = MIN(ds->dirty_lo, va);
+    ds->dirty_hi = MAX(ds->dirty_hi, va + bpp);
+    return hp + (va & 4095);
+}
+
 static void shade_pixel(DrawState *ds, int x, int y, float z, const V4 *in)
 {
     AdrenoState *s = ds->s;
     Thread *tp = &ds->pt;
     int bpp = fmt_bpp_rb(ds->cfmt);
-    uint32_t ns = ds->samples;
-    uint8_t *cp = gmem_at(s, ds->cbase + (y * ds->pitch + x) * ns * bpp);
+    uint32_t ns = ds->sysmem ? 1 : ds->samples;
+    uint8_t *cp = rt_color(ds, x, y, bpp, ns);
 
-    if (!cp || cp + bpp * ns > s->gmem + ADRENO_GMEM_SIZE) {
+    if (!cp) {
         return;
     }
 
@@ -1722,15 +1750,17 @@ static void resolve_span(DrawState *ds, int x0, int x1, int y)
     if (linear && dfmt == ds->cfmt && dswap == ds->cswap && wmask == 0xf &&
         !(ds->cp_ctl & 0xf0)) {
         /* same format: copy the GMEM row as is */
-        uint32_t so = ds->cbase + (y * ds->pitch + x0) * dbpp;
+        uint32_t so = (ds->cbase + (y * ds->pitch + x0) * dbpp) &
+                      (ADRENO_GMEM_SIZE - 1);
         uint32_t len = (x1 - x0) * dbpp;
         if (so + len <= ADRENO_GMEM_SIZE) {
             adreno_write(s, ds->cp_dest +
                          (dy * ds->cp_pitch + x0 + ds->cp_dx) * dbpp,
                          &s->gmem[so], len);
             ds->pixels += x1 - x0;
+            return;
         }
-        return;
+        /* the row wraps around the end of GMEM: per pixel below */
     }
     while (x0 < x1) {
         int n = MIN(x1 - x0, 256);
@@ -1769,6 +1799,7 @@ static bool fast_span_ok(const DrawState *ds, bool persp)
     bool blend = !((ds->cctl >> 5) & 1) || ((ds->blend >> 29) & 1);
 
     return ds->fast.ok && !ds->fast.uses_params && !persp && ds->mode == 4 &&
+           !ds->sysmem &&
            !(ds->zctl & 6) &&
            !((ds->cctl >> 3) & 1) && ds->samples == 1 && ds->cfmt == 5 &&
            ds->cswap == 0 && ds->cmask == 0xf &&
@@ -1789,7 +1820,13 @@ static void fast_span(DrawState *ds, int xa, int xb, int y, float u, float v,
     float tx[4] = { 0, 0, 0, 0 };
     int filter = 0;
 
+    off &= ADRENO_GMEM_SIZE - 1;
     if (off + (uint32_t)(xb - xa + 1) * 4 > ADRENO_GMEM_SIZE) {
+        /* the row wraps around the end of GMEM: split it */
+        int first = (ADRENO_GMEM_SIZE - off) / 4;
+        float k = (float)first;
+        fast_span(ds, xa, xa + first - 1, y, u, v, du, dv);
+        fast_span(ds, xa + first, xb, y, u + du * k, v + dv * k, du, dv);
         return;
     }
     uint8_t *cp = &s->gmem[off];
@@ -1891,6 +1928,12 @@ static void raster_tri(DrawState *ds, const PVtx *v0, const PVtx *v1,
                        const PVtx *v2)
 {
     float area = edge(v0->x, v0->y, v1->x, v1->y, v2->x, v2->y);
+    if (adreno_trace && ds->s->draws >= (uint64_t)adreno_trace_from &&
+        ds->s->draws < (uint64_t)adreno_trace_from + adreno_trace_len) {
+        qemu_log("   tri (%g,%g) (%g,%g) (%g,%g) area %g sc %d,%d-%d,%d\n",
+                 v0->x, v0->y, v1->x, v1->y, v2->x, v2->y, area,
+                 ds->sx0, ds->sy0, ds->sx1, ds->sy1);
+    }
     if (area == 0.0f || !isfinite(area)) {
         return;
     }
@@ -1920,6 +1963,11 @@ static void raster_tri(DrawState *ds, const PVtx *v0, const PVtx *v1,
         return;
     }
 
+    if (adreno_trace && ds->s->draws >= (uint64_t)adreno_trace_from &&
+        ds->s->draws < (uint64_t)adreno_trace_from + adreno_trace_len) {
+        qemu_log("   tri box %d,%d-%d,%d fast %d\n", minx, miny, maxx, maxy,
+                 fast_span_ok(ds, ds->persp && !(v0->rw == v1->rw && v1->rw == v2->rw)));
+    }
     float inv = 1.0f / area;
     /* top-left rule bias */
     bool tl0 = (v1->y == v2->y && v2->x < v1->x) || v2->y < v1->y;
@@ -2135,6 +2183,14 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
     ds->cfmt = r & 0xf;
     ds->cswap = (r >> 9) & 3;
     ds->cbase = r & 0xfffff000;
+    /*
+     * a20x can render to system memory: the colour base is then a GPU
+     * address instead of a GMEM offset (KGSL blobs use it for FBOs).
+     */
+    ds->sysmem = ds->cbase >= ADRENO_GMEM_SIZE;
+    ds->clinear = (r >> 6) & 1;
+    ds->dirty_lo = UINT32_MAX;
+    ds->dirty_hi = 0;
     ds->pitch = s->regs[A2XX_RB_SURFACE_INFO] & 0x3fff;
     /*
      * MSAA_SAMPLES: the blob's fast clear uses 4x with a quarter pitch so
@@ -2244,6 +2300,10 @@ static void dump_state(AdrenoState *s, uint32_t op, const uint32_t *d,
     {
         uint8_t *gp = gmem_at(s, ds->cbase + (200 * ds->pitch + 64) * 4);
         uint32_t pc = s->regs[A2XX_SQ_PS_CONST] & 0x1ff;
+        qemu_log("   cbase %x cinfo %08x zctl %08x zbase %x zfmt %u surf %08x samples %u fast %d/%d\n",
+                 ds->cbase, s->regs[A2XX_RB_COLOR_INFO],
+                 ds->zctl, ds->zbase, ds->zfmt, s->regs[A2XX_RB_SURFACE_INFO],
+                 ds->samples, ds->fast.ok, fast_span_ok(ds, ds->persp));
         qemu_log("   blend %08x cctl %08x cmask %x gmem(64,200) %08x psc0 %g %g %g %g\n",
                  ds->blend, ds->cctl, ds->cmask, gp ? ldl_le_p(gp) : 0,
                  f_of(s->regs[ADRENO_REG_ALU + pc * 4]),
@@ -2454,6 +2514,9 @@ static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
         qemu_log("\n");
     }
     g_hash_table_destroy(cache);
+    if (ds.sysmem && ds.dirty_hi > ds.dirty_lo) {
+        adreno_mark_dirty(s, ds.dirty_lo, ds.dirty_hi - ds.dirty_lo);
+    }
 
     if (adreno_trace && s->draws >= (uint64_t)adreno_trace_from &&
         s->draws < (uint64_t)adreno_trace_from + adreno_trace_len) {
