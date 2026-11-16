@@ -25,6 +25,8 @@
 #include "hw/sysbus.h"
 #include "system/address-spaces.h"
 #include "migration/vmstate.h"
+#include "qemu/main-loop.h"
+#include "qemu/rcu.h"
 #include "adreno.h"
 
 /* ---- registers (dword offsets) ---- */
@@ -117,7 +119,7 @@ long adreno_trace_len = 40;
 
 /* ---------------- interrupts ---------------- */
 
-static void adreno_update_irq(AdrenoState *s)
+static uint32_t adreno_irq_signal(AdrenoState *s)
 {
     uint32_t sig = 0;
 
@@ -134,6 +136,29 @@ static void adreno_update_irq(AdrenoState *s)
         sig |= 1u << 31;
     }
     s->regs[REG_MASTER_INT_SIGNAL] = sig;
+    return sig;
+}
+
+/* caller holds s->lock; from the GPU thread the line is set by a BH */
+static void adreno_update_irq(AdrenoState *s)
+{
+    uint32_t sig = adreno_irq_signal(s);
+
+    if (qemu_thread_is_self(&s->thread)) {
+        qemu_bh_schedule(s->irq_bh);
+    } else {
+        qemu_set_irq(s->irq, sig != 0);
+    }
+}
+
+static void adreno_irq_bh(void *opaque)
+{
+    AdrenoState *s = opaque;
+    uint32_t sig;
+
+    qemu_mutex_lock(&s->lock);
+    sig = adreno_irq_signal(s);
+    qemu_mutex_unlock(&s->lock);
     qemu_set_irq(s->irq, sig != 0);
 }
 
@@ -661,7 +686,7 @@ static void cp_run(AdrenoState *s)
     uint32_t base = s->regs[REG_CP_RB_BASE];
     uint32_t size = 2u << (s->regs[REG_CP_RB_CNTL] & 0x3f);   /* dwords */
     uint32_t mask = size - 1;
-    uint32_t wptr = s->regs[REG_CP_RB_WPTR] & mask;
+    uint32_t wptr = qatomic_read(&s->regs[REG_CP_RB_WPTR]) & mask;
     uint32_t rptr = s->regs[REG_CP_RB_RPTR] & mask;
 
     if (s->regs[REG_CP_ME_CNTL] & 0x10000000 || size > (1u << 22)) {
@@ -673,8 +698,47 @@ static void cp_run(AdrenoState *s)
         for (uint32_t i = 0; i < len; i++) {
             buf[i] = adreno_rd32(s, base + ((rptr + i) & mask) * 4);
         }
-        s->regs[REG_CP_RB_RPTR] = wptr;
+        /*
+         * Like the CP, only take whole packets: KGSL publishes the header
+         * of the NOP that pads the ring up to its end before the wrapped
+         * commands, and the NOP body must not be parsed as packets.
+         */
+        uint32_t whole = 0;
+        while (whole < len) {
+            uint32_t hdr = buf[whole], sz;
+            switch (hdr >> 30) {
+            case 0: sz = 1 + ((hdr >> 16) & 0x3fff) + 1; break;
+            case 1: sz = 3; break;
+            case 2: sz = 1; break;
+            default: sz = 1 + ((hdr >> 16) & 0x3fff) + 1; break;
+            }
+            if (whole + sz > len) {
+                break;
+            }
+            whole += sz;
+        }
+        if (!whole) {
+            return;                     /* wait for the rest of the packet */
+        }
+        len = whole;
+        wptr = (rptr + whole) & mask;
+        static int ringlog = -1;
+        if (ringlog < 0) {
+            ringlog = getenv("ADRENO_RINGLOG") != NULL;
+        }
+        if (ringlog) {
+            qemu_log("adreno: ring %04x-%04x:", rptr, wptr);
+            for (uint32_t i = 0; i < len; i++) {
+                qemu_log(" %08x", buf[i]);
+            }
+            qemu_log("\n");
+        }
         cp_exec(s, buf, len, 0);
+        /* consumed: publish the read pointer once the work is done */
+        qatomic_set(&s->regs[REG_CP_RB_RPTR], wptr);
+        if (ringlog) {
+            qemu_log("adreno: ring done ts %08x\n", s->regs[REG_SCRATCH_REG0]);
+        }
     }
     if (!(s->regs[REG_CP_RB_CNTL] & RB_CNTL_NO_UPDATE) &&
         s->regs[REG_CP_RB_RPTR_ADDR]) {
@@ -685,14 +749,33 @@ static void cp_run(AdrenoState *s)
 
 /* ---------------- MMIO ---------------- */
 
+static uint64_t adreno_mmio_read_locked(AdrenoState *s, uint32_t r);
+
 static uint64_t adreno_mmio_read(void *opaque, hwaddr off, unsigned size)
 {
     AdrenoState *s = opaque;
     uint32_t r = off >> 2;
+    uint64_t v;
 
     switch (r) {
     case REG_RBBM_STATUS:
-        return 0x110;                   /* idle */
+        /* GUI_ACTIVE while the command processor has work */
+        return 0x110 | (qatomic_read(&s->regs[REG_CP_RB_RPTR]) !=
+                        qatomic_read(&s->regs[REG_CP_RB_WPTR]) ? 0x80000000u : 0);
+    case REG_CP_RB_RPTR:
+    case REG_CP_RB_WPTR:
+    case REG_SCRATCH_REG0 ... REG_SCRATCH_REG0 + 7:
+        return qatomic_read(&s->regs[r]);   /* polled: never wait */
+    }
+    qemu_mutex_lock(&s->lock);
+    v = adreno_mmio_read_locked(s, r);
+    qemu_mutex_unlock(&s->lock);
+    return v;
+}
+
+static uint64_t adreno_mmio_read_locked(AdrenoState *s, uint32_t r)
+{
+    switch (r) {
     case REG_RBBM_PERIPHID1:
         return 0x00;                    /* core 0 */
     case REG_RBBM_PERIPHID2:
@@ -707,6 +790,9 @@ static uint64_t adreno_mmio_read(void *opaque, hwaddr off, unsigned size)
     }
 }
 
+static void adreno_mmio_write_locked(AdrenoState *s, uint32_t r,
+                                     uint64_t val);
+
 static void adreno_mmio_write(void *opaque, hwaddr off, uint64_t val,
                               unsigned size)
 {
@@ -715,6 +801,31 @@ static void adreno_mmio_write(void *opaque, hwaddr off, uint64_t val,
 
     if (r >= ADRENO_NREGS) {
         return;
+    }
+    if (r == REG_CP_RB_WPTR) {
+        /* new commands: hand them to the GPU thread, do not wait */
+        qatomic_set(&s->regs[r], (uint32_t)val);
+        qemu_event_set(&s->kick);
+        return;
+    }
+    qemu_mutex_lock(&s->lock);
+    adreno_mmio_write_locked(s, r, val);
+    qemu_mutex_unlock(&s->lock);
+}
+
+static void adreno_mmio_write_locked(AdrenoState *s, uint32_t r, uint64_t val)
+{
+    static int ringlog = -1;
+    if (ringlog < 0) {
+        ringlog = getenv("ADRENO_RINGLOG") != NULL;
+    }
+    if (ringlog && (r == REG_CP_RB_BASE || r == REG_CP_RB_CNTL ||
+        r == REG_CP_ME_CNTL || r == REG_CP_RB_WPTR || r == REG_CP_RB_RPTR ||
+        (r >= 0x1c0 && r < 0x1d0) || r == 0x3b /* RBBM_CNTL */ ||
+        r == 0x3c /* SOFT_RESET */)) {
+        qemu_log("adreno: mmio w %03x = %08x (rptr %x wptr %x me %x)\n", r,
+                 (uint32_t)val, s->regs[REG_CP_RB_RPTR], s->regs[REG_CP_RB_WPTR],
+                 s->regs[REG_CP_ME_CNTL]);
     }
     switch (r) {
     case REG_CP_INT_ACK:
@@ -755,14 +866,10 @@ static void adreno_mmio_write(void *opaque, hwaddr off, uint64_t val,
         s->regs[r] = val;
         s->regs[REG_CP_RB_RPTR] = 0;
         return;
-    case REG_CP_RB_WPTR:
-        s->regs[r] = val;
-        cp_run(s);
-        return;
     case REG_CP_ME_CNTL:
         s->regs[r] = val;
         if (!(val & 0x10000000)) {
-            cp_run(s);
+            qemu_event_set(&s->kick);
         }
         return;
     default:
@@ -778,17 +885,56 @@ static const MemoryRegionOps adreno_ops = {
     .valid = { .min_access_size = 4, .max_access_size = 4 },
 };
 
+static void *adreno_thread(void *opaque)
+{
+    AdrenoState *s = opaque;
+
+    rcu_register_thread();
+    for (;;) {
+        qemu_event_reset(&s->kick);
+        if (qatomic_read(&s->quit)) {
+            break;
+        }
+        qemu_mutex_lock(&s->lock);
+        cp_run(s);
+        bool idle = qatomic_read(&s->regs[REG_CP_RB_RPTR]) ==
+                    (qatomic_read(&s->regs[REG_CP_RB_WPTR]) &
+                     ((2u << (s->regs[REG_CP_RB_CNTL] & 0x3f)) - 1)) ||
+                    (s->regs[REG_CP_ME_CNTL] & 0x10000000);
+        qemu_mutex_unlock(&s->lock);
+        if (idle) {
+            qemu_event_wait(&s->kick);
+        }
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
 static void adreno_reset(DeviceState *dev)
 {
     AdrenoState *s = ADRENO(dev);
 
+    qemu_mutex_lock(&s->lock);
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->istore, 0, sizeof(s->istore));
     memset(s->shadow_en, 0, sizeof(s->shadow_en));
     adreno_tlb_flush(s);
     s->regs[REG_CP_ME_CNTL] = 0x10000000;   /* halted until KGSL starts it */
     adreno_draw_reset(s);
-    adreno_update_irq(s);
+    adreno_irq_signal(s);
+    qemu_mutex_unlock(&s->lock);
+    qemu_set_irq(s->irq, 0);
+}
+
+static void adreno_realize(DeviceState *dev, Error **errp)
+{
+    AdrenoState *s = ADRENO(dev);
+
+    qemu_mutex_init(&s->lock);
+    qemu_event_init(&s->kick, false);
+    s->irq_bh = qemu_bh_new(adreno_irq_bh, s);
+    qemu_thread_create(&s->thread, "adreno-cp", adreno_thread, s,
+                       QEMU_THREAD_JOINABLE);
 }
 
 static void adreno_init(Object *obj)
@@ -814,6 +960,7 @@ static void adreno_class_init(ObjectClass *oc, const void *data)
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     device_class_set_legacy_reset(dc, adreno_reset);
+    dc->realize = adreno_realize;
     dc->desc = "Adreno 200 GPU";
 }
 

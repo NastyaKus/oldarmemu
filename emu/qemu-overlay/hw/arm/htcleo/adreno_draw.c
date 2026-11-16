@@ -2098,6 +2098,28 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
     if (ds->mode == 4 && !nofast) {
         ps_analyze(s, ds);
         stat_fast += ds->fast.ok;
+        if (!ds->fast.ok) {
+            /* name each slow pixel shader once, for fast-path work */
+            static uint32_t seen[32];
+            static int nseen;
+            uint32_t h = 2166136261u;
+            for (uint32_t i = 0; i < 48; i++) {
+                h = (h ^ s->istore[ds->ps_base * 3 + i]) * 16777619u;
+            }
+            bool known = false;
+            for (int i = 0; i < nseen; i++) {
+                known |= seen[i] == h;
+            }
+            if (!known && nseen < 32) {
+                seen[nseen++] = h;
+                qemu_log_mask(LOG_UNIMP, "adreno: slow pixel shader %08x:", h);
+                for (uint32_t i = 0; i < 48; i++) {
+                    qemu_log_mask(LOG_UNIMP, " %08x",
+                                  s->istore[ds->ps_base * 3 + i]);
+                }
+                qemu_log_mask(LOG_UNIMP, "\n");
+            }
+        }
     }
     ds->cp_dest = s->regs[A2XX_RB_COPY_DEST_BASE];
     ds->cp_pitch = (s->regs[A2XX_RB_COPY_DEST_PITCH] & 0x1ff) << 5;
@@ -2249,7 +2271,8 @@ static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
         break;
     }
     s->draws++;
-    if (adreno_trace && !(s->draws % 64) && !access("/tmp/adreno-trace", F_OK)) {
+    if (!(s->draws % 64) && !access("/tmp/adreno-trace", F_OK)) {
+        adreno_trace = 1;
         unlink("/tmp/adreno-trace");
         adreno_trace_from = s->draws + 1;
     }

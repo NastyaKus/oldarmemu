@@ -25,6 +25,7 @@
 
 #define MSM_GPU_REG_PHYS        0xA0000000
 #define MSM_UART1DM_PHYS        0xA0200000
+#define MSM_UART2DM_PHYS        0xA0900000
 #define MSM_SDC1_PHYS           0xA0300000
 #define MSM_SDC2_PHYS           0xA0400000
 #define MSM_SDC3_PHYS           0xA0500000

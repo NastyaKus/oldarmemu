@@ -57,6 +57,8 @@ class MainActivity : Activity() {
                 st.wipeNand(); refresh()
             }
         }
+        add("Разметка NAND (размер system, как ppp в cLK)") { chooseLayout() }
+        add("Графика: GPU Adreno / программная") { chooseGraphics() }
         add("Журнал загрузки ядра") { showLog() }
         col.addView(TextView(this).apply {
             textSize = 12f
@@ -81,6 +83,8 @@ class MainActivity : Activity() {
             append(if (st.recovery.exists()) "есть (${st.recovery.length() / 1024} КБ)" else "нет")
             append("\nNAND: ")
             append(if (st.nand.exists() && st.nand.length() > 0) "$nandMb МБ образ" else "пустой")
+            append("\n").append(st.nandLayout().label)
+            append("\nГрафика: ").append(if (st.gpu) "эмуляция GPU Adreno 200" else "программный OpenGL")
             append("\nSD-карта: ")
             append(if (sd.isEmpty()) "пусто" else sd.joinToString(", "))
         }
@@ -130,6 +134,46 @@ class MainActivity : Activity() {
         startActivity(Intent(this, EmulatorActivity::class.java).putExtra("boot", boot))
     }
 
+    private fun chooseLayout() {
+        val cur = st.nandLayout()
+        val items = Storage.LAYOUTS.map { (if (it == cur) "● " else "") + it.label }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Разметка NAND")
+            .setItems(items) { _, i ->
+                val l = Storage.LAYOUTS[i]
+                if (l == cur) return@setItems
+                confirm("Новая разметка: ${l.label}.\n\nNAND будет стёрта, прошивку нужно будет " +
+                        "поставить заново (recovery и SD-карта останутся).") {
+                    st.setNandLayout(l); refresh()
+                }
+            }
+            .show()
+    }
+
+    private fun chooseGraphics() {
+        val opts = arrayOf("GPU: эмуляция Adreno 200 (быстрее, OpenGL ES 2.0)",
+                           "Программный OpenGL ES 1.x (совместимость)")
+        AlertDialog.Builder(this)
+            .setTitle("Графика")
+            .setSingleChoiceItems(opts, if (st.gpu) 0 else 1) { d, i ->
+                d.dismiss()
+                thread {
+                    st.gpu = i == 0
+                    runOnUiThread {
+                        refresh()
+                        AlertDialog.Builder(this)
+                            .setMessage(if (st.hasCompatZip())
+                                "zz-hd2emu-compat.zip пересобран. Прошейте его в recovery, " +
+                                "чтобы применить." else
+                                "Добавьте прошивку на SD-карту: zz-hd2emu-compat.zip " +
+                                "появится с этой настройкой.")
+                            .setPositiveButton("OK", null).show()
+                    }
+                }
+            }
+            .show()
+    }
+
     private fun confirm(text: String, action: () -> Unit) {
         AlertDialog.Builder(this).setMessage(text)
             .setPositiveButton("Да") { _, _ -> action() }
@@ -152,9 +196,11 @@ class MainActivity : Activity() {
         const val REQ_RECOVERY = 1
         const val REQ_SDCARD = 2
         const val HELP = """Как поставить прошивку, как на настоящий HD2:
+0) для ICS/JB/KK выберите разметку NAND 1024 МБ (system 300–400 МБ), для GB хватит 512/150;
 1) импортируйте recovery для NAND (например recovery_5.0.2.6_leo_CWR.zip);
 2) добавьте zip прошивки на SD-карту (рядом сам появится zz-hd2emu-compat.zip);
-3) «Загрузить Recovery» → install zip from sdcard → прошивка, затем zz-hd2emu-compat.zip;
+3) «Загрузить Recovery» → install zip from sdcard → прошивка (в AROMA выберите
+   установку в NAND, «system@NAND, data@NAND»), затем zz-hd2emu-compat.zip;
 4) «Загрузить Android из NAND».
 Кнопки HD2: Громк.± — навигация в recovery, «Вызов» — выбор, «Назад» — назад, «Питание» — разбудить экран."""
     }

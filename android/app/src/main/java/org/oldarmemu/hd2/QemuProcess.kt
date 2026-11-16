@@ -35,14 +35,16 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
         return f.readText().trim().also { f.delete() }
     }
 
-    fun start(boot: Boot, nandMb: Int = 512) {
+    fun start(boot: Boot) {
+        val nl = st.nandLayout()
         rebootFile.delete()
         st.hostlink.delete()
         st.qmpSocket.delete()
         val args = mutableListOf(
             binary.absolutePath,
             "-L", dataDir().absolutePath,
-            "-M", "htc-leo,nand-size=$nandMb,reboot-file=${rebootFile.absolutePath}" +
+            "-M", "htc-leo,nand-size=${nl.sizeMb},system-size=${nl.systemMb}" +
+                ",cache-size=${nl.cacheMb},reboot-file=${rebootFile.absolutePath}" +
                 ",hostlink=${st.hostlink.absolutePath},pin-cpu=on" +
                 if (boot == Boot.RECOVERY && !st.recovery.exists()) ",boot-mode=recovery" else "",
             "-accel", "tcg,tb-size=256",

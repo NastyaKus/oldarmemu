@@ -132,6 +132,13 @@ static const struct {
     { 0x30100002, 0x00000000 },     /* HTC acoustic */
     { 0x30100003, 0x00000000 },     /* HTC acoustic (QSD) */
     { 0x30000048, 0x00010001 },     /* TIMEREMOTE: the RTC */
+    /*
+     * GPS (PDSM and its ATL proxy): libgps of 4.x ROMs dereferences the
+     * client handles unconditionally, so the programs must exist; calls
+     * succeed and no fix ever arrives.
+     */
+    { 0x3000005b, 0x00010001 },     /* PDSM */
+    { 0x3000001d, 0x00010001 },     /* PDSM_ATL */
 };
 
 #define TIMEREMOTE_PROG                 0x30000048

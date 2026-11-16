@@ -3,7 +3,7 @@
 
   logcat-from-ram.py ram.bin [filter-regex]
 
-Scans for 2.6/3.0-era struct logger_entry records
+Scans for 2.6/3.0-era struct logger_entry (v1 and v2) records
   u16 len; u16 pad; s32 pid, tid, sec, nsec; payload = prio, tag\\0, msg\\0
 and prints them sorted by timestamp.
 """
@@ -18,11 +18,17 @@ out = {}
 # payload starts with a priority byte 2..7 followed by a printable tag
 for m in re.finditer(rb"[\x02-\x07][A-Za-z][\x20-\x7e]{0,40}\x00", data):
     p = m.start()
-    if p < 20:
+    if p < 24:
         continue
-    ln, pad, pid, tid, sec, nsec = struct.unpack_from("<HHiiii", data, p - 20)
-    if pad != 0 or not (3 <= ln <= 4076) or not (0 < pid < 65536) \
-            or not (0 <= sec < MAX_SEC) or not (0 <= nsec < 1000000000):
+    # v1: u16 len, u16 pad(0), pid, tid, sec, nsec;  v2 (JB+): pad = hdr_size
+    # 24, then u32 euid before the payload
+    for h in (24, 20):
+        ln, pad, pid, tid, sec, nsec = struct.unpack_from("<HHiiii", data, p - h)
+        if pad == (0 if h == 20 else 24) and 3 <= ln <= 4076 and \
+                0 < pid < 65536 and 0 <= sec < MAX_SEC and \
+                0 <= nsec < 1000000000:
+            break
+    else:
         continue
     payload = data[p:p + ln]
     try:

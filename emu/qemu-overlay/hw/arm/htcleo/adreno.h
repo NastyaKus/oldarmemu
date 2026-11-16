@@ -8,6 +8,7 @@
 
 #include "hw/sysbus.h"
 #include "qom/object.h"
+#include "qemu/thread.h"
 
 #define TYPE_ADRENO "msm-adreno"
 OBJECT_DECLARE_SIMPLE_TYPE(AdrenoState, ADRENO)
@@ -53,6 +54,18 @@ struct AdrenoState {
 
     /* statistics */
     uint64_t draws;
+
+    /*
+     * The command processor runs in its own thread, like the GPU next to
+     * the CPU: WPTR writes only wake it.  "lock" guards the register file
+     * and all GPU state; the thread never takes the BQL (interrupts are
+     * raised from a bottom half).
+     */
+    QemuThread thread;
+    QemuMutex lock;
+    QemuEvent kick;
+    QEMUBH *irq_bh;
+    bool quit;
 };
 
 #define ADRENO_REG_ALU          0x4000

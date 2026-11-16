@@ -102,14 +102,34 @@ static void dmov_copy(MsmDmovState *s, hwaddr src, hwaddr dst, uint32_t len)
     }
 }
 
-/* Execute an array of commands; returns false on a malformed list. */
-static bool dmov_run_cmds(MsmDmovState *s, hwaddr a, int *budget)
+/*
+ * Reads from a UART_DM receive FIFO wait for data (CRCI) that our UARTs
+ * never produce (Bluetooth on ttyHS0): leave such commands pending until
+ * the driver flushes the channel.  Completing them at once makes msm_hs
+ * resubmit forever in interrupt context.
+ */
+static bool dmov_waits_forever(uint32_t src)
+{
+    return (src >= MSM_UART1DM_PHYS && src < MSM_UART1DM_PHYS + 0x1000) ||
+           (src >= MSM_UART2DM_PHYS && src < MSM_UART2DM_PHYS + 0x1000);
+}
+
+enum { RUN_BAD, RUN_DONE, RUN_PENDING };
+
+/* Execute an array of commands */
+static int dmov_run_cmds(MsmDmovState *s, hwaddr a, int *budget)
 {
     for (;;) {
         uint32_t cmd = rd32(s, a);
 
         if (--(*budget) < 0) {
-            return false;
+            return RUN_BAD;
+        }
+        if ((cmd & CMD_MODE_MASK) == CMD_MODE_SINGLE ||
+            (cmd & CMD_MODE_MASK) == CMD_MODE_BOX) {
+            if (dmov_waits_forever(rd32(s, a + 4))) {
+                return RUN_PENDING;
+            }
         }
         switch (cmd & CMD_MODE_MASK) {
         case CMD_MODE_SINGLE: {
@@ -145,10 +165,10 @@ static bool dmov_run_cmds(MsmDmovState *s, hwaddr a, int *budget)
         default:
             qemu_log_mask(LOG_UNIMP, "msm-dmov: command mode %u not "
                           "supported\n", cmd & CMD_MODE_MASK);
-            return false;
+            return RUN_BAD;
         }
         if (cmd & CMD_LC) {
-            return true;
+            return RUN_DONE;
         }
     }
 }
@@ -166,13 +186,13 @@ static void dmov_start(MsmDmovState *s, int ch, uint32_t val)
 {
     hwaddr a = (hwaddr)(val & 0x1fffffff) << 3;
     int budget = MAX_CMDS;
-    bool ok = true;
+    int r = RUN_DONE;
 
     if ((val >> 29) == DMOV_CMD_PTR_LIST) {
         for (;;) {
             uint32_t p = rd32(s, a);
-            if (!dmov_run_cmds(s, (hwaddr)(p & 0x1fffffff) << 3, &budget)) {
-                ok = false;
+            r = dmov_run_cmds(s, (hwaddr)(p & 0x1fffffff) << 3, &budget);
+            if (r != RUN_DONE) {
                 break;
             }
             if (p & CMD_PTR_LP) {
@@ -181,13 +201,16 @@ static void dmov_start(MsmDmovState *s, int ch, uint32_t val)
             a += 4;
         }
     } else if ((val >> 29) == DMOV_CMD_LIST) {
-        ok = dmov_run_cmds(s, a, &budget);
+        r = dmov_run_cmds(s, a, &budget);
     } else {
         qemu_log_mask(LOG_UNIMP, "msm-dmov: cmd ptr type %u\n", val >> 29);
-        ok = false;
+        r = RUN_BAD;
+    }
+    if (r == RUN_PENDING) {
+        return;                         /* completes with the next flush */
     }
     dmov_push_result(s, ch, DMOV_RSLT_VALID |
-                     (ok ? DMOV_RSLT_DONE : DMOV_RSLT_ERROR));
+                     (r == RUN_DONE ? DMOV_RSLT_DONE : DMOV_RSLT_ERROR));
 }
 
 static uint64_t dmov_read(void *opaque, hwaddr off, unsigned size)

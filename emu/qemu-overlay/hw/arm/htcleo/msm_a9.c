@@ -238,8 +238,14 @@ static void a9_handle_proc_comm(MsmA9State *s)
     uint32_t d1 = smem_rd(s, PC_APP_DATA1);
     uint32_t d2 = smem_rd(s, PC_APP_DATA2);
 
-    qemu_log_mask(LOG_UNIMP, "msm-a9: proc_comm cmd %u data 0x%x 0x%x\n",
-                  cmd, d1, d2);
+    static uint8_t logged[256];
+
+    /* clock and vreg toggles come by the thousand (KGSL power management) */
+    if (logged[cmd & 0xff] < 8) {
+        logged[cmd & 0xff]++;
+        qemu_log_mask(LOG_UNIMP, "msm-a9: proc_comm cmd %u data 0x%x 0x%x\n",
+                      cmd, d1, d2);
+    }
     smem_wr(s, PC_APP_STATUS, PCOM_CMD_SUCCESS);
     smem_wr(s, PC_APP_COMMAND, PCOM_CMD_DONE);
 

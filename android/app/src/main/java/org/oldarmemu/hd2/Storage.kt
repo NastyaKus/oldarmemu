@@ -19,6 +19,43 @@ class Storage(private val ctx: Context) {
     val console = File(dir, "console.log")
     val hostlink = File(dir, "hostlink.shm")
     val qmpSocket = File(dir, "qmp.sock")
+    private val nandCfg = File(dir, "nand.cfg")
+    private val graphicsCfg = File(dir, "graphics.cfg")
+    private val lastRom = File(dir, "last-rom.txt")
+
+    /** NAND chip size and cLK partition sizes ("ppp"), all in MiB. */
+    data class NandLayout(val sizeMb: Int, val systemMb: Int, val cacheMb: Int) {
+        val label get() = "NAND $sizeMb МБ: system $systemMb МБ, cache $cacheMb МБ"
+    }
+
+    /**
+     * Layout of the current NAND image.  Images made before the setting
+     * existed used the HD2 EU layout; new ones get room for JB/KK ROMs.
+     */
+    fun nandLayout(): NandLayout {
+        runCatching {
+            val v = nandCfg.readText().trim().split(Regex("\\s+")).map { it.toInt() }
+            if (v.size == 3) return NandLayout(v[0], v[1], v[2])
+        }
+        val l = if (nand.exists() && nand.length() > 0) LAYOUT_EU else LAYOUT_DEFAULT
+        nandCfg.writeText("${l.sizeMb} ${l.systemMb} ${l.cacheMb}\n")
+        return l
+    }
+
+    /** Re-partition: the NAND is erased (like changing the cLK ppp sizes). */
+    fun setNandLayout(l: NandLayout) {
+        nand.delete()
+        nandCfg.writeText("${l.sizeMb} ${l.systemMb} ${l.cacheMb}\n")
+    }
+
+    /** true: the emulated Adreno 200; false: Android's software GL. */
+    var gpu: Boolean
+        get() = runCatching { graphicsCfg.readText().trim() != "soft" }.getOrDefault(true)
+        set(v) {
+            graphicsCfg.writeText(if (v) "gpu\n" else "soft\n")
+            lastRom.takeIf { it.exists() }?.readText()?.trim()?.let { File(it) }
+                ?.takeIf { it.exists() }?.let { makeCompatZip(it) }
+        }
 
     fun displayName(uri: Uri): String {
         ctx.contentResolver.query(uri, null, null, null, null)?.use { c ->
@@ -82,16 +119,19 @@ class Storage(private val ctx: Context) {
     }
 
     /**
-     * Until the Adreno 200 GPU is emulated ROMs must use Android's software
-     * GL renderer.  Build "zz-hd2emu-compat.zip" (flash it after the ROM):
-     * it reuses the ROM's own update-binary and rewrites egl.cfg.
+     * Build "zz-hd2emu-compat.zip" (flash it after the ROM).  It reuses the
+     * ROM's own edify update-binary (for AROMA installers the real one,
+     * update-binary-installer), selects the GPU or software GL and removes
+     * the MDP blitter HALs (copybit, hwcomposer), which the emulator lacks.
      */
     private fun makeCompatZip(rom: File) {
         val launcher = File(ctx.cacheDir, "Launcher2.apk")
         val launcher2d = File(ctx.cacheDir, "Launcher2-2d.apk")
         val binary = try {
             ZipFile(rom).use { z ->
-                val e = z.getEntry("META-INF/com/google/android/update-binary") ?: return
+                val e = z.getEntry("META-INF/com/google/android/update-binary-installer")
+                    ?: z.getEntry("META-INF/com/google/android/update-binary") ?: return
+                lastRom.writeText(rom.absolutePath)
                 z.getEntry(LAUNCHER2)?.let { l ->
                     z.getInputStream(l).use { i -> launcher.outputStream().use { i.copyTo(it) } }
                 }
@@ -107,14 +147,16 @@ class Storage(private val ctx: Context) {
         } finally {
             launcher.delete()
         }
-        val out = File(sdcard, "zz-hd2emu-compat.zip")
+        val out = File(sdcard, COMPAT)
+        val gpu = this.gpu
         ZipOutputStream(out.outputStream()).use { z ->
             z.putNextEntry(ZipEntry("META-INF/com/google/android/update-binary"))
             z.write(binary); z.closeEntry()
             z.putNextEntry(ZipEntry("META-INF/com/google/android/updater-script"))
-            z.write(compatScript(patched).toByteArray()); z.closeEntry()
+            z.write(compatScript(patched, gpu).toByteArray()); z.closeEntry()
             z.putNextEntry(ZipEntry("egl.cfg"))
-            z.write("0 0 android\n".toByteArray()); z.closeEntry()
+            z.write((if (gpu) "0 0 android\n0 1 adreno200\n" else "0 0 android\n").toByteArray())
+            z.closeEntry()
             if (patched) {
                 z.putNextEntry(ZipEntry("Launcher2.apk"))
                 launcher2d.inputStream().use { it.copyTo(z) }
@@ -146,25 +188,42 @@ class Storage(private val ctx: Context) {
         nand.delete()
     }
 
+    fun hasCompatZip() = File(sdcard, COMPAT).exists()
+
     companion object {
         const val LAUNCHER2 = "system/app/Launcher2.apk"
+        const val COMPAT = "zz-hd2emu-compat.zip"
+        val LAYOUT_EU = NandLayout(512, 150, 44)
+        val LAYOUT_DEFAULT = NandLayout(1024, 300, 44)
+        val LAYOUTS = listOf(
+            LAYOUT_EU,                      // HD2 EU, Gingerbread ROMs
+            NandLayout(512, 250, 10),       // EU HD2 with a bigger ROM
+            LAYOUT_DEFAULT,                 // HD2 T-Mobile US: ICS/JB ROMs
+            NandLayout(1024, 400, 44),      // KitKat and large ROMs
+        )
 
-        fun compatScript(launcher2d: Boolean) = buildString {
+        fun compatScript(launcher2d: Boolean, gpu: Boolean = true) = buildString {
             append("""ui_print("HD2 emulator compatibility");
 mount("yaffs2", "MTD", "system", "/system");
 package_extract_file("egl.cfg", "/system/lib/egl/egl.cfg");
 set_perm(0, 0, 0644, "/system/lib/egl/egl.cfg");
-delete("/system/lib/hw/copybit.qsd8k.so", "/system/lib/hw/copybit.msm7k.so");
-delete("/system/app/LiveWallpapers.apk", "/system/app/MagicSmokeWallpapers.apk",
+delete("/system/lib/hw/copybit.qsd8k.so", "/system/lib/hw/copybit.msm7k.so",
+       "/system/lib/hw/hwcomposer.qsd8k.so", "/system/lib/hw/hwcomposer.msm7k.so",
+       "/system/lib/hw/hwcomposer.default.so");
+""")
+            if (!gpu) append("""delete("/system/app/LiveWallpapers.apk", "/system/app/MagicSmokeWallpapers.apk",
        "/system/app/VisualizationWallpapers.apk");
 """)
             if (launcher2d) append("""package_extract_file("Launcher2.apk", "/$LAUNCHER2");
 set_perm(0, 0, 0644, "/$LAUNCHER2");
 """)
             append("""unmount("/system");
-ui_print("software OpenGL ES enabled, copybit (MDP blitter) disabled");
+""")
+            append(if (gpu) "ui_print(\"OpenGL ES: emulated Adreno 200\");\n"
+                   else """ui_print("OpenGL ES: software renderer");
 ui_print("RenderScript live wallpapers removed (need OpenGL ES 2.0)");
 """)
+            append("ui_print(\"copybit and hwcomposer (MDP blitter) disabled\");\n")
             if (launcher2d) append("ui_print(\"Launcher2: 2D app drawer instead of RenderScript 3D\");\n")
         }
     }
