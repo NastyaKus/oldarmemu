@@ -32,6 +32,7 @@
 #include "target/arm/cpu-qom.h"
 #include "cpu.h"
 #include "msm.h"
+#include "adreno.h"
 #include "leo_boot.h"
 
 #define HTCLEO_MACH_ID          2524
@@ -246,7 +247,6 @@ static void leo_map_stubs(void)
 
     /* named stubs for blocks we know about, so the logs are readable */
     static const struct { const char *name; hwaddr base; uint64_t size; } st[] = {
-        { "gpu",       MSM_GPU_REG_PHYS,   0x20000 },
         { "uartdm1",   MSM_UART1DM_PHYS,   0x1000 },
         { "sdc3",      MSM_SDC3_PHYS,      0x1000 },
         { "sdc4",      MSM_SDC4_PHYS,      0x1000 },
@@ -578,6 +578,15 @@ static void htc_leo_init(MachineState *machine)
         i2c_slave_create_simple(bus, TYPE_I2C_REGFILE, 0x48);   /* tps65023 */
         i2c_slave_create_simple(bus, TYPE_I2C_REGFILE, 0x1C);   /* akm8973 */
         i2c_slave_create_simple(bus, "leo-ds2746", 0x26);       /* fuel gauge */
+    }
+
+    /* Adreno 200 GPU */
+    {
+        DeviceState *gpu = qdev_new(TYPE_ADRENO);
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(gpu), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(gpu), 0, MSM_GPU_REG_PHYS);
+        sysbus_connect_irq(SYS_BUS_DEVICE(gpu), 0,
+                           qdev_get_gpio_in(s->vic, INT_GRAPHICS));
     }
 
     /* display controller (MDP 3.1 + LCDC panel) */
