@@ -82,6 +82,12 @@ enum {
 #define SMSM_STATE_MODEM        1
 #define SMSM_STATE_APPS_DEM     3
 #define SMSM_STATE_POWER_MASTER_DEM 6
+#define SMSM_STATE_TIME_MASTER_DEM  7
+
+/* time sync with the modem's sleep clock, timer.c (N-way SMSM) */
+#define DEM_TIME_MASTER_TIME_PENDING_APPS   0x0001
+#define DEM_TIME_SLAVE_TIME_REQUEST         0x0400
+#define DEM_TIME_SLAVE_TIME_POLL            0x0800
 
 /* DEM (dynamic environment manager) sleep handshake, pm.c */
 #define DEM_SLAVE_SMSM_RUN          0x0001
@@ -110,6 +116,9 @@ enum {
 #define PCOM_READY              0x1
 #define PCOM_CMD_SUCCESS        0x3
 #define PCOM_CMD_FAIL           0x4
+#define PCOM_RESET_CHIP         3
+#define PCOM_POWER_DOWN         10
+#define PCOM_RESET_CHIP_IMM     42
 
 /* ---- WinCE DEX interface ---- */
 #define DEX_BASE                0xEFE00
@@ -189,7 +198,7 @@ static bool a9_dex_exec(MsmA9State *s, uint32_t cmd, uint32_t d1, uint32_t d2,
         *r2 = 0;
         return true;
     case 0x14: /* DEX_POWER_OFF */
-        qemu_log_mask(LOG_GUEST_ERROR, "msm-a9: DEX power off requested\n");
+        leo_request_power_off();
         return false;
     default:
         return false;
@@ -229,10 +238,27 @@ static void a9_handle_proc_comm(MsmA9State *s)
     uint32_t d1 = smem_rd(s, PC_APP_DATA1);
     uint32_t d2 = smem_rd(s, PC_APP_DATA2);
 
-    qemu_log_mask(LOG_UNIMP, "msm-a9: proc_comm cmd %u data 0x%x 0x%x\n",
-                  cmd, d1, d2);
+    static uint8_t logged[256];
+
+    /* clock and vreg toggles come by the thousand (KGSL power management) */
+    if (logged[cmd & 0xff] < 8) {
+        logged[cmd & 0xff]++;
+        qemu_log_mask(LOG_UNIMP, "msm-a9: proc_comm cmd %u data 0x%x 0x%x\n",
+                      cmd, d1, d2);
+    }
     smem_wr(s, PC_APP_STATUS, PCOM_CMD_SUCCESS);
     smem_wr(s, PC_APP_COMMAND, PCOM_CMD_DONE);
+
+    switch (cmd) {
+    case PCOM_RESET_CHIP:
+    case PCOM_RESET_CHIP_IMM:
+        /* data1: restart reason, as also saved for cLK at 0x2FFB0000 */
+        leo_request_reboot(d1);
+        break;
+    case PCOM_POWER_DOWN:
+        leo_request_power_off();
+        break;
+    }
 }
 
 /*
@@ -256,6 +282,26 @@ static void a9_handle_smsm(MsmA9State *s)
         master |= DEM_MASTER_SMSM_RUN;
     }
     smem_wr(s, off + SMSM_STATE_POWER_MASTER_DEM * 4, master);
+
+    /*
+     * Sleep clock sync (msm_timer_sync_smem_clock): the apps side raises
+     * TIME_REQUEST, waits for PENDING_APPS, switches to TIME_POLL and
+     * reads SMEM_SMEM_SLOW_CLOCK_VALUE; back at TIME_INIT the master
+     * drops PENDING_APPS.  Without an answer every idle entry would spin
+     * through two 7.8 ms timeouts.
+     */
+    uint32_t clk = smem_rd(s, SMEM_TOC_OFF + SMEM_SMEM_SLOW_CLOCK_VALUE * 16 + 4);
+    if (!clk) {
+        return;
+    }
+    if (apps & (DEM_TIME_SLAVE_TIME_REQUEST | DEM_TIME_SLAVE_TIME_POLL)) {
+        smem_wr(s, clk, msm_csr_gpt_count() | 1);
+        smem_wr(s, off + SMSM_STATE_TIME_MASTER_DEM * 4,
+                DEM_TIME_MASTER_TIME_PENDING_APPS);
+    } else {
+        smem_wr(s, off + SMSM_STATE_TIME_MASTER_DEM * 4, 0);
+        smem_wr(s, clk, 0);
+    }
 }
 
 static void a9_doorbell(void *opaque, int n, int level)

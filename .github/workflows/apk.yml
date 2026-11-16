@@ -1,0 +1,85 @@
+name: APK
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["docs/**", "**.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    env:
+      NDK_VERSION: 27.2.12479018
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends meson ninja-build pkg-config flex bison python3-venv
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" > /dev/null
+          echo "NDK=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Cache QEMU source and Android dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/android/arm64-v8a/prefix
+            build/android/src
+          key: deps-arm64-${{ hashFiles('tools/android/build-deps.sh') }}
+
+      - name: QEMU source
+        run: ./tools/prepare-qemu.sh
+
+      - name: Dependencies (glib, pixman, pcre2, libffi)
+        run: ABI=arm64-v8a ./tools/android/build-deps.sh
+
+      - name: QEMU for Android
+        run: ABI=arm64-v8a ./tools/android/build-qemu.sh
+
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > android/app/dev.keystore
+          else
+            keytool -genkeypair -keystore android/app/dev.keystore -storepass oldarmemu \
+              -keypass oldarmemu -alias dev -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=oldarmemu dev"
+          fi
+
+      - name: Build APK
+        working-directory: android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 0.1.${{ github.run_number }}
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+          ./gradlew --no-daemon assembleRelease testReleaseUnitTest
+          cp app/build/outputs/apk/release/app-release.apk ../hd2emu-0.1.${{ github.run_number }}.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hd2emu-apk
+          path: hd2emu-*.apk
+
+      - name: Publish as "latest" pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-${{ github.ref_name }}
+          name: HD2 emulator (latest ${{ github.ref_name }})
+          prerelease: true
+          files: hd2emu-*.apk

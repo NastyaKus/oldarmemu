@@ -64,6 +64,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(MsmSdccState, MSM_SDCC)
 #define ST_TXFIFOEMPTY      (1u << 18)
 #define ST_RXFIFOEMPTY      (1u << 19)
 #define ST_RXDATAAVLBL      (1u << 21)
+#define CMD_PROGENA         (1u << 11)
 #define ST_PROGDONE         (1u << 23)
 #define ST_STATIC_MASK      0x05c007ff  /* bits cleared through MMCICLEAR */
 
@@ -80,6 +81,8 @@ struct MsmSdccState {
     uint32_t status;            /* latched (static) status bits */
     uint32_t mask[2];
 };
+
+static int sdcc_trace = -1;
 
 static bool data_active(MsmSdccState *s)
 {
@@ -119,6 +122,9 @@ static void sdcc_data_progress(MsmSdccState *s, uint32_t n)
     s->remaining = n >= s->remaining ? 0 : s->remaining - n;
     if (!s->remaining) {
         s->status |= ST_DATAEND | ST_DATABLOCKEND;
+        if (sdcc_trace > 0) {
+            qemu_log("sdcc: dataend (%s)\n", s->datactrl & DPSM_DIRECTION ? "read" : "write");
+        }
     }
 }
 
@@ -132,6 +138,14 @@ static void sdcc_do_command(MsmSdccState *s)
     req.arg = s->arg;
     rlen = sdbus_do_command(&s->sdbus, &req, resp, sizeof(resp));
     s->respcmd = req.cmd;
+    if (sdcc_trace < 0) {
+        sdcc_trace = getenv("SDCC_TRACE") != NULL;
+    }
+    if (sdcc_trace) {
+        qemu_log("sdcc: cmd %u arg %08x rlen %zu resp %02x%02x%02x%02x dctrl %x len %u rem %u\n",
+                 req.cmd, req.arg, rlen, resp[0], resp[1], resp[2], resp[3],
+                 s->datactrl, s->datalength, s->remaining);
+    }
 
     if (s->cmd & CMD_RESPONSE) {
         if (rlen == 0 || (rlen == 4 && (s->cmd & CMD_LONGRSP)) ||
@@ -230,6 +244,14 @@ static void sdcc_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         s->cmd = val;
         if (val & CMD_ENABLE) {
             sdcc_do_command(s);
+            /*
+             * PROGENA (R1b commands such as CMD12 after a write): the
+             * driver waits for PROGDONE, i.e. for the card to stop
+             * being busy.  Our card never is.
+             */
+            if (val & CMD_PROGENA) {
+                s->status |= ST_PROGDONE;
+            }
         }
         break;
     case MMCIDATATIMER: s->datatimer = val; break;

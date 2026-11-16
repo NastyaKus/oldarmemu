@@ -59,6 +59,8 @@ struct MsmCsrState {
     uint32_t regs[0x1000 / 4];   /* backing store for everything else */
 };
 
+static MsmCsrState *csr_instance;
+
 static uint32_t mt_count(MsmTimer *t)
 {
     if (!(t->enable & TIMER_ENABLE_EN)) {
@@ -67,6 +69,12 @@ static uint32_t mt_count(MsmTimer *t)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     uint64_t ticks = muldiv64(now - t->ns_base, t->freq, NANOSECONDS_PER_SECOND);
     return t->count_base + (uint32_t)ticks;
+}
+
+/* The modem's view of the sleep clock (same 32 kHz source as the GPT). */
+uint32_t msm_csr_gpt_count(void)
+{
+    return csr_instance ? mt_count(&csr_instance->t[0]) : 0;
 }
 
 /* Freeze the counter at its current value and re-base the time origin. */
@@ -228,6 +236,7 @@ static void csr_init(Object *obj)
     MsmCsrState *s = MSM_CSR(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
+    csr_instance = s;
     memory_region_init_io(&s->iomem, obj, &csr_ops, s, "msm-csr", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
     for (int i = 0; i < 2; i++) {

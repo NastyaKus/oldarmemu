@@ -419,6 +419,52 @@ static void regfile_class_init(ObjectClass *oc, const void *data)
     k->send = regfile_send;
 }
 
+/* ======================= DS2746 fuel gauge ======================= */
+
+/*
+ * Maxim DS2746 battery monitor (I2C 0x26), read by the HD2 kernel's
+ * ds2746_battery driver every few seconds.  Present a healthy, full
+ * battery: without it the gauge reads as missing/empty and Android
+ * powers the phone off.  Register values follow the driver's scaling
+ * (drivers/power/ds2746_param.c):
+ *   VOLT  (0x0c/0x0d) >> 4  * 2.44 mV
+ *   AUX0  (0x08/0x09) >> 4  doubles as battery ID and NTC temperature
+ *   ACR   (0x10/0x11)       * 625/1580 - 500 mAh
+ */
+#define TYPE_LEO_DS2746 "leo-ds2746"
+
+static void ds2746_reset(DeviceState *dev)
+{
+    I2cRegfileState *s = I2C_REGFILE(dev);
+    uint16_t volt = (4150 * 100 / 244) << 4;         /* 4.15 V */
+    /*
+     * 30 C (600k NTC table), also read as a 1230 mAh pack.  Not 25.0 C:
+     * the driver starts from "25.0 C, 99%" and only reports the level to
+     * htc_battery when one of them changes, so Android would see 0% (and
+     * power off) until the next poll 50 s later.
+     */
+    uint16_t aux0 = 255 << 4;
+    uint16_t acr = (1230 + 500) * 1580 / 625 + 1;     /* full */
+
+    regfile_reset(dev);
+    s->regs[0x01] = 0x03;                   /* STATUS: AIN0 | AIN1 ready */
+    s->regs[0x08] = aux0 >> 8;
+    s->regs[0x09] = aux0;
+    s->regs[0x0a] = aux0 >> 8;              /* AUX1 */
+    s->regs[0x0b] = aux0;
+    s->regs[0x0c] = volt >> 8;
+    s->regs[0x0d] = volt;
+    s->regs[0x0e] = 0;                      /* CURRENT: 0 mA */
+    s->regs[0x0f] = 0;
+    s->regs[0x10] = acr >> 8;
+    s->regs[0x11] = acr;
+}
+
+static void ds2746_class_init(ObjectClass *oc, const void *data)
+{
+    device_class_set_legacy_reset(DEVICE_CLASS(oc), ds2746_reset);
+}
+
 static const TypeInfo leo_i2c_types[] = {
     {
         .name = TYPE_LEO_TOUCH,
@@ -436,6 +482,10 @@ static const TypeInfo leo_i2c_types[] = {
         .parent = TYPE_I2C_SLAVE,
         .instance_size = sizeof(I2cRegfileState),
         .class_init = regfile_class_init,
+    }, {
+        .name = TYPE_LEO_DS2746,
+        .parent = TYPE_I2C_REGFILE,
+        .class_init = ds2746_class_init,
     },
 };
 

@@ -14,8 +14,12 @@ SCRIPT = '''ui_print("HD2 emulator compatibility");
 mount("yaffs2", "MTD", "system", "/system");
 package_extract_file("egl.cfg", "/system/lib/egl/egl.cfg");
 set_perm(0, 0, 0644, "/system/lib/egl/egl.cfg");
+delete("/system/lib/hw/copybit.qsd8k.so", "/system/lib/hw/copybit.msm7k.so");
+delete("/system/app/LiveWallpapers.apk", "/system/app/MagicSmokeWallpapers.apk",
+       "/system/app/VisualizationWallpapers.apk");
 unmount("/system");
-ui_print("software OpenGL ES enabled");
+ui_print("software OpenGL ES enabled, copybit (MDP blitter) disabled");
+ui_print("RenderScript live wallpapers removed (need OpenGL ES 2.0)");
 '''
 
 def main(rom, out):

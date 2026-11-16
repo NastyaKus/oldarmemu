@@ -18,7 +18,7 @@
 | Hardware buttons (keypad matrix + power) | done |
 | Android boot.img as -kernel (HLE cLK) | done |
 | Boot from NAND (raw boot.img or yaffs2 zImage+initrd.gz) | done |
-| Android app | todo |
+| Android app (arm64 APK: QEMU as child process, VNC screen, touch, HD2 buttons, FAT32 SD image) | v0.1 |
 
 Reference kernel: tytung htcleo 2.6.32 completes all driver init in ~2 s and
 stops at mounting the root fs (no ROM attached yet).

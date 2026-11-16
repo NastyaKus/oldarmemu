@@ -73,7 +73,14 @@ struct MsmMdpState {
     uint32_t lcdc_en;
     GHashTable *regs;           /* everything else, plain storage */
     uint8_t *line;              /* scratch for one source line */
+
+    /* hostlink output: dirty tracking of the scanned out buffer */
+    MemoryRegionSection hl_sec;
+    uint64_t hl_key[3];         /* address/format/size it was set up for */
+    bool hl_on;
 };
+
+static void mdp_hostlink_update(MsmMdpState *s);
 
 static void mdp_update_irq(MsmMdpState *s)
 {
@@ -91,6 +98,7 @@ static void mdp_vsync(void *opaque)
     MsmMdpState *s = opaque;
 
     if (s->lcdc_en & 1) {
+        mdp_hostlink_update(s);
         mdp_raise(s, INT_LCDC_FRAME_START | INT_DMA_P_DONE);
         timer_mod(s->vsync, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + FRAME_NS);
     }
@@ -181,6 +189,131 @@ static void mdp_gfx_update(void *opaque)
     dpy_gfx_update_full(s->con);
 }
 
+/* ---------------- hostlink (shared memory) output ---------------- */
+
+static void mdp_scanout_format(MsmMdpState *s, int *w, int *h, int *bpp,
+                               int *stride, bool *bgr)
+{
+    *w = s->dma_p_size & 0xfff;
+    *h = (s->dma_p_size >> 16) & 0x7ff;
+    if (!*w || !*h || *w > LEO_LCD_W || *h > LEO_LCD_H) {
+        *w = LEO_LCD_W;
+        *h = LEO_LCD_H;
+    }
+    *stride = s->dma_p_stride;
+    switch ((s->dma_p_config >> DMA_IBUF_FORMAT_SHIFT) & 3) {
+    case DMA_IBUF_FORMAT_RGB565:
+        *bpp = 2;
+        break;
+    case DMA_IBUF_FORMAT_XRGB8888:
+        *bpp = 4;
+        break;
+    default:
+        *bpp = (*stride && *stride / *w >= 4) ? 4 : 3;
+        break;
+    }
+    if (!*stride) {
+        *stride = *w * *bpp;
+    }
+    *bgr = ((s->dma_p_config >> DMA_PACK_PATTERN_SHIFT) & 0x3f) == 0x12;
+}
+
+/* one scan line to RGBA bytes (Android's ARGB_8888 bitmap layout) */
+static void mdp_row_to_rgba(uint8_t *d, const uint8_t *src, int w, int bpp,
+                            bool bgr)
+{
+    int ri = bgr ? 2 : 0, bi = bgr ? 0 : 2;
+
+    if (bpp == 2) {
+        for (int x = 0; x < w; x++, d += 4) {
+            uint16_t v = lduw_le_p(src + x * 2);
+            unsigned r = (v >> 11) & 0x1f, g = (v >> 5) & 0x3f, b = v & 0x1f;
+            d[ri] = (r << 3) | (r >> 2);
+            d[1] = (g << 2) | (g >> 4);
+            d[bi] = (b << 3) | (b >> 2);
+            d[3] = 0xff;
+        }
+    } else {
+        /* memory order B G R (A) */
+        for (int x = 0; x < w; x++, d += 4, src += bpp) {
+            d[bi] = src[0];
+            d[1] = src[1];
+            d[ri] = src[2];
+            d[3] = 0xff;
+        }
+    }
+}
+
+/*
+ * Copy what changed in the scanned out buffer to the shared frame buffer.
+ * Guest writes are tracked with the DIRTY_MEMORY_VGA bitmap, so a still
+ * screen costs nothing; a page flip redraws everything once.
+ */
+static void mdp_hostlink_update(MsmMdpState *s)
+{
+    uint8_t *fb = leo_hostlink_fb();
+    int w, h, bpp, stride;
+    bool bgr, all = false, changed = false;
+
+    if (!fb) {
+        return;
+    }
+    if (!(s->lcdc_en & 1) || !s->dma_p_ibuf) {
+        if (s->hl_on) {
+            memset(fb, 0, LEO_LCD_W * LEO_LCD_H * 4);
+            s->hl_on = false;
+            leo_hostlink_fb_done(LEO_LCD_W, LEO_LCD_H, false);
+        }
+        return;
+    }
+    mdp_scanout_format(s, &w, &h, &bpp, &stride, &bgr);
+    uint64_t key[3] = { s->dma_p_ibuf, s->dma_p_config,
+                        ((uint64_t)s->dma_p_size << 32) | stride };
+    if (memcmp(key, s->hl_key, sizeof(key)) || !s->hl_sec.mr) {
+        if (s->hl_sec.mr) {
+            memory_region_unref(s->hl_sec.mr);
+        }
+        s->hl_sec = memory_region_find(get_system_memory(), s->dma_p_ibuf,
+                                       (uint64_t)stride * h);
+        if (s->hl_sec.mr && (!memory_region_is_ram(s->hl_sec.mr) ||
+                             int128_get64(s->hl_sec.size) <
+                             (uint64_t)stride * h)) {
+            memory_region_unref(s->hl_sec.mr);
+            s->hl_sec.mr = NULL;
+        }
+        if (!s->hl_sec.mr) {
+            return;
+        }
+        memory_region_set_log(s->hl_sec.mr, true, DIRTY_MEMORY_VGA);
+        memcpy(s->hl_key, key, sizeof(key));
+        all = true;
+    }
+    if (!s->hl_on) {
+        all = true;
+    }
+
+    MemoryRegion *mr = s->hl_sec.mr;
+    hwaddr off = s->hl_sec.offset_within_region;
+    const uint8_t *src = (uint8_t *)memory_region_get_ram_ptr(mr) + off;
+    DirtyBitmapSnapshot *snap =
+        memory_region_snapshot_and_clear_dirty(mr, off, (hwaddr)stride * h,
+                                               DIRTY_MEMORY_VGA);
+    for (int y = 0; y < h; y++) {
+        if (all || memory_region_snapshot_get_dirty(mr, snap,
+                                                    off + (hwaddr)y * stride,
+                                                    w * bpp)) {
+            mdp_row_to_rgba(fb + y * LEO_LCD_W * 4, src + y * stride, w, bpp,
+                            bgr);
+            changed = true;
+        }
+    }
+    g_free(snap);
+    if (changed) {
+        s->hl_on = true;
+        leo_hostlink_fb_done(w, h, true);
+    }
+}
+
 static const GraphicHwOps mdp_gfx_ops = {
     .gfx_update = mdp_gfx_update,
 };
@@ -220,7 +353,23 @@ static void mdp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
         return;
     case MDP_DMA_P_CONFIG:      s->dma_p_config = val; return;
     case MDP_DMA_P_SIZE:        s->dma_p_size = val; return;
-    case MDP_DMA_P_IBUF_ADDR:   s->dma_p_ibuf = val; return;
+    case MDP_DMA_P_IBUF_ADDR:
+        s->dma_p_ibuf = val;
+        /*
+         * msm_fb points DMA_P at the new buffer and then sleeps until the
+         * next LCDC frame start.  Our "panel" has nothing to scan out at a
+         * fixed rate, so show the frame right away instead of making every
+         * eglSwapBuffers wait up to 16.7 ms (which also quantised the frame
+         * rate to 60/30/20/15).  1 ms leaves time to enable the interrupt.
+         */
+        if (s->lcdc_en & 1) {
+            int64_t soon = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + SCALE_MS;
+            int64_t due = timer_expire_time_ns(s->vsync);
+            if (due < 0 || due > soon) {
+                timer_mod(s->vsync, soon);
+            }
+        }
+        return;
     case MDP_DMA_P_IBUF_Y_STRIDE: s->dma_p_stride = val; return;
     case MDP_LCDC_EN:
         s->lcdc_en = val;
@@ -229,6 +378,7 @@ static void mdp_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + FRAME_NS);
         } else {
             timer_del(s->vsync);
+            mdp_hostlink_update(s);         /* blank the front end */
         }
         return;
     case MDP_DMA_P_START:
@@ -269,6 +419,8 @@ static void mdp_reset(DeviceState *dev)
     s->dma_p_stride = LEO_LCD_W * 4;
     s->lcdc_en = 0;
     g_hash_table_remove_all(s->regs);
+    memset(s->hl_key, 0, sizeof(s->hl_key));
+    mdp_hostlink_update(s);
 }
 
 static void mdp_realize(DeviceState *dev, Error **errp)

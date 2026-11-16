@@ -15,4 +15,8 @@ arm_common_ss.add(when: 'CONFIG_HTC_LEO', if_true: files(
   'msm_sdcc.c',
   'leo_smd.c',
   'leo_quirks.c',
+  'leo_hostlink.c',
+  'adreno.c',
+  'adreno_draw.c',
+  'adreno_etc1.c',
 ))

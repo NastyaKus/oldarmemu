@@ -25,6 +25,7 @@
 
 #define MSM_GPU_REG_PHYS        0xA0000000
 #define MSM_UART1DM_PHYS        0xA0200000
+#define MSM_UART2DM_PHYS        0xA0900000
 #define MSM_SDC1_PHYS           0xA0300000
 #define MSM_SDC2_PHYS           0xA0400000
 #define MSM_SDC3_PHYS           0xA0500000
@@ -112,11 +113,29 @@ void msm_gpio_set_default(DeviceState *dev, int n, bool level);
 bool msm_nand_read_page(DeviceState *dev, uint32_t page, uint8_t *data,
                         uint8_t *oob);
 
+/*
+ * Guest asked the modem to restart (reason as in the HD2 kernel's pm.c,
+ * 0x77665502 = recovery) or to power off.
+ */
+void leo_request_reboot(uint32_t reason);
+void leo_request_power_off(void);
+
 /* Kernel fix-ups for emulation, see leo_quirks.c */
 void leo_apply_kernel_quirks(void);
 void leo_reset_kernel_quirks(void);
 void leo_quirks_set_ram(void *host, uint64_t size);
 bool leo_quirk_rename_smd_channel(const char *from, const char *to);
+
+/* Current GPT (32 kHz sleep clock) count, for the modem's time sync. */
+uint32_t msm_csr_gpt_count(void);
+
+/* Shared memory link to the front end (screen, sound), leo_hostlink.c */
+bool leo_hostlink_open(const char *path, Error **errp);
+uint8_t *leo_hostlink_fb(void);                 /* NULL when not in use */
+void leo_hostlink_fb_done(int w, int h, bool lcd_on);
+void leo_hostlink_audio_format(uint32_t rate, uint32_t channels);
+void leo_hostlink_audio_write(const uint8_t *pcm, uint32_t len);
+void leo_pin_fast_cpus(void);
 
 /* Press/release an HD2 hardware button (index, see htc_leo.c). */
 void leo_set_key(int key, bool down);

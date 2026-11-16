@@ -1,8 +1,19 @@
+diff --git a/configs/devices/arm-softmmu/default.mak b/configs/devices/arm-softmmu/default.mak
+index 57ef1b8..756d573 100644
+--- a/configs/devices/arm-softmmu/default.mak
++++ b/configs/devices/arm-softmmu/default.mak
+@@ -42,3 +42,6 @@
+ # CONFIG_FSL_IMX7=n
+ # CONFIG_FSL_IMX6UL=n
+ # CONFIG_ALLWINNER_H3=n
++
++# HTC HD2 (Leo); the Android build uses --without-default-devices
++CONFIG_HTC_LEO=y
 diff --git a/hw/arm/Kconfig b/hw/arm/Kconfig
-index 2aa4b5d..0f2e6e7 100644
+index 2aa4b5d..4c2d98b 100644
 --- a/hw/arm/Kconfig
 +++ b/hw/arm/Kconfig
-@@ -692,3 +692,8 @@ config ARMSSE
+@@ -692,3 +692,10 @@ config ARMSSE
      select UNIMP
      select SSE_COUNTER
      select SSE_TIMER
@@ -11,6 +22,8 @@ index 2aa4b5d..0f2e6e7 100644
 +    bool
 +    default y
 +    depends on TCG && ARM
++    select I2C
++    select SD
 diff --git a/hw/arm/boot.c b/hw/arm/boot.c
 index d391cd0..f1917b1 100644
 --- a/hw/arm/boot.c
@@ -54,6 +67,25 @@ index a2e22bd..351d2df 100644
      /* multicore boards that use the default secondary core boot functions
       * can ignore these two function calls. If the default functions won't
       * work, then write_secondary_boot() should write a suitable blob of
+diff --git a/target/arm/helper.c b/target/arm/helper.c
+index 518c0c1..b070d74 100644
+--- a/target/arm/helper.c
++++ b/target/arm/helper.c
+@@ -354,6 +354,14 @@ static void dacr_write(CPUARMState *env, const ARMCPRegInfo *ri, uint64_t value)
+ {
+     ARMCPU *cpu = env_archcpu(env);
+ 
++    /*
++     * Linux 2.6 rewrites DACR on every thread switch, almost always with
++     * the value it already has; a TLB flush (which also empties the TB
++     * jump cache) each time made Android ~1.45x slower.
++     */
++    if (raw_read(env, ri) == value) {
++        return;
++    }
+     raw_write(env, ri, value);
+     tlb_flush(CPU(cpu)); /* Flush TLB as domain not tracked in TLB */
+ }
 diff --git a/target/arm/tcg/cpu32.c b/target/arm/tcg/cpu32.c
 index a2a23ea..1b1e1a1 100644
 --- a/target/arm/tcg/cpu32.c
@@ -128,3 +160,32 @@ index a2a23ea..1b1e1a1 100644
      { .name = "cortex-a9",   .initfn = cortex_a9_initfn },
      { .name = "cortex-a15",  .initfn = cortex_a15_initfn },
      { .name = "cortex-r5",   .initfn = cortex_r5_initfn },
+diff --git a/util/oslib-posix.c b/util/oslib-posix.c
+index 4ff577e..e1c7b35 100644
+--- a/util/oslib-posix.c
++++ b/util/oslib-posix.c
+@@ -1003,7 +1003,14 @@ int qemu_shm_alloc(size_t size, Error **errp)
+     g_string_printf(shm_name, "/qemu-" FMT_pid "-shm-%d", getpid(),
+                     cur_sequence);
+ 
++#ifdef __ANDROID__
++    /* bionic has no POSIX shm; an unlinked memfd behaves the same here */
++    (void)oflag;
++    (void)mode;
++    fd = syscall(__NR_memfd_create, shm_name->str + 1, 0);
++#else
+     fd = shm_open(shm_name->str, oflag, mode);
++#endif
+     if (fd < 0) {
+         error_setg_errno(errp, errno,
+                          "failed to create POSIX shared memory");
+@@ -1015,7 +1022,9 @@ int qemu_shm_alloc(size_t size, Error **errp)
+      * POSIX shared memory object. However it will remain allocated as long as
+      * there are file descriptors pointing to it.
+      */
++#ifndef __ANDROID__
+     shm_unlink(shm_name->str);
++#endif
+ 
+     if (ftruncate(fd, size) == -1) {
+         error_setg_errno(errp, errno,
