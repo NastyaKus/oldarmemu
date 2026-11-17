@@ -14,8 +14,8 @@ android {
         applicationId = "org.oldarmemu.hd2"
         minSdk = 28
         targetSdk = 34          // QEMU runs from nativeLibraryDir (exec allowed there)
-        versionCode = (System.getenv("VERSION_CODE") ?: "11").toInt()
-        versionName = System.getenv("VERSION_NAME") ?: "0.3.0"
+        versionCode = (System.getenv("VERSION_CODE") ?: "12").toInt()
+        versionName = System.getenv("VERSION_NAME") ?: "0.4.0"
         ndk { abiFilters += listOf("arm64-v8a") }
     }
 

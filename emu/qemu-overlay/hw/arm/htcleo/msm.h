@@ -144,6 +144,7 @@ void leo_pin_fast_cpus(void);
 void leo_set_key(int key, bool down);
 
 /* Set the value a stub register holds after reset (bootloader state). */
+void msm_stub_selfclear(DeviceState *dev, hwaddr off, uint32_t mask);
 void msm_stub_preset(DeviceState *dev, hwaddr off, uint32_t val);
 
 /* SDIO card on an SDCC slot (msm_sdcc.c); the card streams CMD53 data */

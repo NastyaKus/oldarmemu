@@ -240,13 +240,14 @@ static uint64_t dmov_read(void *opaque, hwaddr off, unsigned size)
     ch = (off >> 2) & (DMOV_NCH - 1);
 
     if (off == DMOV_ISR) {
+        /*
+         * Read-to-clear.  The handler then drains every result of each
+         * flagged channel, so results still queued at this point must not
+         * re-raise the line: that cost a second, empty interrupt ("result
+         * not valid") for every completed transfer.
+         */
         v = s->isr;
         s->isr = 0;
-        for (int i = 0; i < DMOV_NCH; i++) {
-            if (s->rslt_count[i]) {
-                s->isr |= 1u << i;
-            }
-        }
         dmov_update(s);
         return v;
     }
@@ -261,6 +262,11 @@ static uint64_t dmov_read(void *opaque, hwaddr off, unsigned size)
         memmove(&s->rslt[ch][0], &s->rslt[ch][1],
                 (RSLT_FIFO - 1) * sizeof(uint32_t));
         s->rslt_count[ch]--;
+        if (!s->rslt_count[ch]) {
+            /* results pushed while the handler ran are drained by it too */
+            s->isr &= ~(1u << ch);
+            dmov_update(s);
+        }
         return v;
     case DMOV_STATUS:
         v = DMOV_STATUS_CMD_PTR_RDY;

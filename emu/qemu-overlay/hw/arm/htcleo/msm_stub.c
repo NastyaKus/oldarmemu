@@ -36,6 +36,7 @@ struct MsmStubState {
     uint64_t base;
     GHashTable *regs;
     GHashTable *presets;   /* offset -> reset value */
+    GHashTable *selfclear; /* offset -> bits that always read as 0 */
 };
 
 static StubReg *stub_reg(MsmStubState *s, hwaddr off)
@@ -53,7 +54,9 @@ static uint64_t stub_read(void *opaque, hwaddr off, unsigned size)
     MsmStubState *s = opaque;
     hwaddr aligned = off & ~3ULL;
     StubReg *r = stub_reg(s, aligned);
-    uint64_t v = r->val >> ((off & 3) * 8);
+    uint32_t sc = GPOINTER_TO_UINT(g_hash_table_lookup(s->selfclear,
+                                                       GUINT_TO_POINTER(aligned)));
+    uint64_t v = (r->val & ~sc) >> ((off & 3) * 8);
 
     if (size < 4) {
         v &= (1ULL << (size * 8)) - 1;
@@ -99,6 +102,7 @@ static void stub_realize(DeviceState *dev, Error **errp)
     }
     s->regs = g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, g_free);
     s->presets = g_hash_table_new(g_direct_hash, g_direct_equal);
+    s->selfclear = g_hash_table_new(g_direct_hash, g_direct_equal);
     memory_region_init_io(&s->iomem, OBJECT(s), &stub_ops, s, s->name, s->size);
     sysbus_init_mmio(SYS_BUS_DEVICE(s), &s->iomem);
 }
@@ -126,6 +130,18 @@ void msm_stub_preset(DeviceState *dev, hwaddr off, uint32_t val)
     g_hash_table_insert(s->presets, GUINT_TO_POINTER(off & ~3ULL),
                         GUINT_TO_POINTER(val));
     stub_reg(s, off & ~3ULL)->val = val;
+}
+
+/*
+ * Bits the hardware clears by itself once the requested operation is done
+ * (busy/"go" bits).  Without this the kernel spins until its timeouts.
+ */
+void msm_stub_selfclear(DeviceState *dev, hwaddr off, uint32_t mask)
+{
+    MsmStubState *s = MSM_STUB(dev);
+
+    g_hash_table_insert(s->selfclear, GUINT_TO_POINTER(off & ~3ULL),
+                        GUINT_TO_POINTER(mask));
 }
 
 static const Property stub_props[] = {

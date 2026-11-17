@@ -9,6 +9,7 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/timer.h"
 #include "qemu/module.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
@@ -146,6 +147,35 @@ static void vic_set_irq(void *opaque, int n, int level)
     vic_update(s);
 }
 
+/* LEO_IRQSTATS=1: interrupts taken per source, every 5 s (on stderr) */
+static void vic_count(int n)
+{
+    static int on = -1;
+    static unsigned cnt[MSM_VIC_NUM_IRQS];
+    static int64_t last;
+    int64_t now;
+
+    if (on < 0) {
+        on = getenv("LEO_IRQSTATS") != NULL;
+    }
+    if (!on || n < 0 || n >= MSM_VIC_NUM_IRQS) {
+        return;
+    }
+    cnt[n]++;
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (now - last >= 5000) {
+        fprintf(stderr, "irqstats:");
+        for (int i = 0; i < MSM_VIC_NUM_IRQS; i++) {
+            if (cnt[i]) {
+                fprintf(stderr, " %d:%u", i, cnt[i]);
+            }
+        }
+        fprintf(stderr, "\n");
+        memset(cnt, 0, sizeof(cnt));
+        last = now;
+    }
+}
+
 static uint64_t vic_read(void *opaque, hwaddr off, unsigned size)
 {
     MsmVicState *s = opaque;
@@ -195,6 +225,7 @@ static uint64_t vic_read(void *opaque, hwaddr off, unsigned size)
         return s->last_irq;
     case VIC_IRQ_VEC_PEND_RD:
         n = vic_first(s, false);
+        vic_count(n);
         return n >= 0 ? n : s->no_pend_val;
     case VIC_FIQ_VEC_RD:
     case VIC_FIQ_VEC_PEND_RD:

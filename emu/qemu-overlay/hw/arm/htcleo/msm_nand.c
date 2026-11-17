@@ -28,6 +28,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/qdev-properties-system.h"
 #include "system/block-backend.h"
+#include "block/block_int.h"
 #include "migration/vmstate.h"
 #include "msm.h"
 
@@ -106,6 +107,8 @@ struct MsmNandState {
     uint32_t cur_page;
     uint32_t cur_cw;
     uint8_t buf[CW_SIZE];
+    uint8_t *map;                 /* the image file, mmap()ed */
+    bool map_rw;
 };
 
 /* ---- backing store ---- */
@@ -119,7 +122,9 @@ static void invert(uint8_t *p, int len)
 
 static bool nand_load(MsmNandState *s, uint64_t off, void *buf, int len)
 {
-    if (s->blk) {
+    if (s->map) {
+        memcpy(buf, s->map + off, len);
+    } else if (s->blk) {
         if (blk_pread(s->blk, off, len, buf, 0) < 0) {
             return false;
         }
@@ -135,11 +140,49 @@ static bool nand_store(MsmNandState *s, uint64_t off, const void *buf, int len)
     g_autofree uint8_t *tmp = g_memdup2(buf, len);
 
     invert(tmp, len);
+    if (s->map) {
+        if (!s->map_rw) {
+            return false;
+        }
+        memcpy(s->map + off, tmp, len);
+        return true;
+    }
     if (s->blk) {
         return blk_pwrite(s->blk, off, len, tmp, 0) >= 0;
     }
     memcpy(s->ram + off, tmp, len);
     return true;
+}
+
+/*
+ * A raw image file is mapped instead of going through the block layer:
+ * the driver reads one 528-byte codeword per access, thousands of times a
+ * second while Android boots, and each blk_pread() is a round trip
+ * through the I/O thread pool that puts the vCPU thread to sleep.  The
+ * page cache writes the mapping back to the file.
+ */
+static void nand_map_file(MsmNandState *s, uint64_t want, bool rw)
+{
+    BlockDriverState *bs = blk_bs(s->blk);
+    void *p;
+    int fd;
+
+    if (getenv("LEO_NAND_NOMAP") || !bs || !bs->drv ||
+        strcmp(bs->drv->format_name, "raw") || !bs->file ||
+        !bs->file->bs->drv || strcmp(bs->file->bs->drv->format_name, "file")) {
+        return;
+    }
+    fd = qemu_open_old(bs->file->bs->filename, rw ? O_RDWR : O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    p = mmap(NULL, want, PROT_READ | (rw ? PROT_WRITE : 0), MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) {
+        return;
+    }
+    s->map = p;
+    s->map_rw = rw;
 }
 
 static uint64_t cw_offset(uint32_t page, uint32_t cw)
@@ -504,6 +547,7 @@ static void nand_realize(DeviceState *dev, Error **errp)
                        " bytes (%u MiB in 2112-byte pages)", want, s->size_mb);
             return;
         }
+        nand_map_file(s, want, rw);
     } else {
         s->ram = g_malloc0(want);   /* inverted storage: zero == erased */
     }

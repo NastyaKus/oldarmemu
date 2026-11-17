@@ -242,6 +242,28 @@ static void a9_handle_proc_comm(MsmA9State *s)
     uint32_t d2 = smem_rd(s, PC_APP_DATA2);
 
     static uint8_t logged[256];
+    static unsigned stats[256];
+    static int64_t stats_t;
+    static int stats_on = -1;
+
+    if (stats_on < 0) {
+        stats_on = getenv("LEO_IRQSTATS") != NULL;
+    }
+    if (stats_on) {
+        int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+        stats[cmd & 0xff]++;
+        if (now - stats_t >= 5000) {
+            fprintf(stderr, "pcomstats:");
+            for (int i = 0; i < 256; i++) {
+                if (stats[i]) {
+                    fprintf(stderr, " %d:%u", i, stats[i]);
+                }
+            }
+            fprintf(stderr, "\n");
+            memset(stats, 0, sizeof(stats));
+            stats_t = now;
+        }
+    }
 
     /* clock and vreg toggles come by the thousand (KGSL power management) */
     if (logged[cmd & 0xff] < 8) {

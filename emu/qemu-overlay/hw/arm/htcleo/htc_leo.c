@@ -285,11 +285,30 @@ static void leo_map_stubs(void)
         { "clk_ctl", 0x3AC, 1 },
     };
 
+    /*
+     * Busy bits that complete at once: the HS-USB endpoint flush/prime and
+     * status, the controller reset and the ULPI viewport "run" bit.  The
+     * gadget driver otherwise spins in flush_endpoint_hw() and ulpi_*()
+     * until their timeouts, a large share of boot time.
+     */
+    static const struct { const char *name; hwaddr off; uint32_t mask; } sc[] = {
+        { "hsusb", 0x140, 1u << 1 },        /* USBCMD.RST */
+        { "hsusb", 0x170, 1u << 30 },       /* ULPI_VIEWPORT.RUN */
+        { "hsusb", 0x1b0, 0xffffffff },     /* ENDPTPRIME */
+        { "hsusb", 0x1b4, 0xffffffff },     /* ENDPTFLUSH */
+        { "hsusb", 0x1b8, 0xffffffff },     /* ENDPTSTAT */
+    };
+
     for (int i = 0; i < ARRAY_SIZE(st); i++) {
         DeviceState *d = msm_stub_create(st[i].name, st[i].base, st[i].size, 0);
         for (int j = 0; j < ARRAY_SIZE(pre); j++) {
             if (!strcmp(pre[j].name, st[i].name)) {
                 msm_stub_preset(d, pre[j].off, pre[j].val);
+            }
+        }
+        for (int j = 0; j < ARRAY_SIZE(sc); j++) {
+            if (!strcmp(sc[j].name, st[i].name)) {
+                msm_stub_selfclear(d, sc[j].off, sc[j].mask);
             }
         }
     }

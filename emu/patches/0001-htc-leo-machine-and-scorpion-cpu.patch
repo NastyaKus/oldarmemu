@@ -54,6 +54,95 @@ index dc68391..851132a 100644
  arm_common_ss.add(files('boot.c'))
  
  hw_arch += {'arm': arm_ss}
+diff --git a/hw/sd/sd.c b/hw/sd/sd.c
+index 8c29059..af76fbc 100644
+--- a/hw/sd/sd.c
++++ b/hw/sd/sd.c
+@@ -38,6 +38,7 @@
+ #include "hw/irq.h"
+ #include "hw/registerfields.h"
+ #include "system/block-backend.h"
++#include "block/block_int.h"
+ #include "hw/sd/sd.h"
+ #include "migration/vmstate.h"
+ #include "qapi/error.h"
+@@ -120,6 +121,10 @@ typedef struct SDProto {
+ struct SDState {
+     DeviceState parent_obj;
+ 
++    /* raw image file mapped into memory (see sd_map_file) */
++    uint8_t *map;
++    uint64_t map_size;
++
+     /* SD Memory Card Registers */
+     uint32_t ocr;
+     uint8_t scr[8];
+@@ -1058,6 +1063,10 @@ static void sd_blk_read(SDState *sd, uint64_t addr, uint32_t len)
+ {
+     trace_sdcard_read_block(addr, len);
+     addr += sd_bootpart_offset(sd);
++    if (sd->map && addr + len <= sd->map_size) {
++        memcpy(sd->data, sd->map + addr, len);
++        return;
++    }
+     if (!sd->blk || blk_pread(sd->blk, addr, len, sd->data, 0) < 0) {
+         fprintf(stderr, "sd_blk_read: read error on host side\n");
+     }
+@@ -1067,6 +1076,10 @@ static void sd_blk_write(SDState *sd, uint64_t addr, uint32_t len)
+ {
+     trace_sdcard_write_block(addr, len);
+     addr += sd_bootpart_offset(sd);
++    if (sd->map && addr + len <= sd->map_size) {
++        memcpy(sd->map + addr, sd->data, len);
++        return;
++    }
+     if (!sd->blk || blk_pwrite(sd->blk, addr, len, sd->data, 0) < 0) {
+         fprintf(stderr, "sd_blk_write: write error on host side\n");
+     }
+@@ -2767,6 +2780,35 @@ static void sd_instance_finalize(Object *obj)
+     timer_free(sd->ocr_power_timer);
+ }
+ 
++/*
++ * Map a raw image file instead of reading it block by block through the
++ * block layer: each blk_pread() from the vCPU thread is a round trip
++ * through the I/O thread pool, which made an emulated phone's SD card
++ * slow.  The page cache writes the mapping back to the file.
++ */
++static void sd_map_file(SDState *sd, int64_t size)
++{
++    BlockDriverState *bs = blk_bs(sd->blk);
++    void *p;
++    int fd;
++
++    if (getenv("QEMU_SD_NOMAP") || size <= 0 || !bs || !bs->drv ||
++        strcmp(bs->drv->format_name, "raw") || !bs->file ||
++        !bs->file->bs->drv || strcmp(bs->file->bs->drv->format_name, "file")) {
++        return;
++    }
++    fd = qemu_open_old(bs->file->bs->filename, O_RDWR);
++    if (fd < 0) {
++        return;
++    }
++    p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++    close(fd);
++    if (p != MAP_FAILED) {
++        sd->map = p;
++        sd->map_size = size;
++    }
++}
++
+ static void sd_realize(DeviceState *dev, Error **errp)
+ {
+     SDState *sd = SDMMC_COMMON(dev);
+@@ -2817,6 +2859,7 @@ static void sd_realize(DeviceState *dev, Error **errp)
+             return;
+         }
+         blk_set_dev_ops(sd->blk, &sd_block_ops, sd);
++        sd_map_file(sd, blk_size);
+     }
+ }
+ 
 diff --git a/include/hw/arm/boot.h b/include/hw/arm/boot.h
 index a2e22bd..351d2df 100644
 --- a/include/hw/arm/boot.h
