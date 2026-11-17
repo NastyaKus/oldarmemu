@@ -35,7 +35,7 @@ if [ ! -f build.ninja ]; then
         --disable-linux-aio --disable-linux-io-uring --disable-seccomp \
         --disable-cap-ng --disable-attr --disable-libudev --disable-mpath \
         --disable-vnc-jpeg --disable-png --disable-vnc-sasl --enable-vnc \
-        --disable-slirp --disable-plugins --enable-fdt=internal --disable-zstd \
+        --enable-slirp --disable-plugins --enable-fdt=internal --disable-zstd \
         --disable-bzip2 --disable-lzo --disable-snappy --disable-gnutls \
         --disable-nettle --disable-gcrypt --disable-crypto-afalg --disable-libssh \
         --disable-curl --disable-rbd --disable-glusterfs --disable-libiscsi \

@@ -1,7 +1,9 @@
 package org.oldarmemu.hd2
 
 import android.content.Context
+import android.net.ConnectivityManager
 import java.io.File
+import java.net.Inet4Address
 
 /** Runs the bundled qemu-system-arm (htc-leo machine) as a child process. */
 class QemuProcess(private val ctx: Context, private val st: Storage) {
@@ -60,6 +62,9 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
         if (boot == Boot.RECOVERY && st.recovery.exists()) {
             args += listOf("-kernel", st.recovery.absolutePath)
         }
+        // Wi-Fi: the emulated BCM4329 sees one access point, "HD2-Emulator",
+        // NATed through the phone's own connection (QEMU user networking)
+        if (cfg.wifi) args += listOf("-netdev", "user,id=wifi")
         if (!st.nand.exists()) st.nand.createNewFile()   // grown on first use
         st.prepareSdImage()
         val pb = ProcessBuilder(args)
@@ -67,7 +72,24 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
             .redirectErrorStream(true)
             .redirectOutput(File(st.dir, "qemu.log"))
         pb.environment()["TMPDIR"] = ctx.cacheDir.absolutePath
+        if (cfg.wifi) pb.environment()["SLIRP_RESOLV_CONF"] = writeResolvConf().absolutePath
         process = pb.start()
+    }
+
+    /* Android has no /etc/resolv.conf: give the NAT the phone's DNS servers */
+    private fun writeResolvConf(): File {
+        val servers = mutableListOf<String>()
+        try {
+            val cm = ctx.getSystemService(ConnectivityManager::class.java)
+            cm?.getLinkProperties(cm.activeNetwork)?.dnsServers?.forEach { a ->
+                if (a is Inet4Address) a.hostAddress?.let { servers += it }
+            }
+        } catch (_: Exception) {
+        }
+        servers += listOf("8.8.8.8", "1.1.1.1")
+        val f = File(st.dir, "resolv.conf")
+        f.writeText(servers.distinct().take(3).joinToString("") { "nameserver $it\n" })
+        return f
     }
 
     fun stop() {

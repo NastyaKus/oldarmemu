@@ -34,6 +34,7 @@
 #include "msm.h"
 #include "adreno.h"
 #include "leo_boot.h"
+#include "leo_bcm4329.h"
 
 #define HTCLEO_MACH_ID          2524
 #define LEO_EBI1_DEFAULT_SIZE   (512 * MiB)
@@ -298,6 +299,8 @@ static void leo_map_stubs(void)
 #define LEO_GPIO_TP_INT_N       92
 #define LEO_GPIO_POWER_KEY      94
 #define LEO_GPIO_SD_STATUS      153
+#define LEO_GPIO_WIFI_SHUTDOWN_N 129
+#define LEO_GPIO_WIFI_IRQ       152
 #define LEO_GPIO_HDS_MIC        35
 #define LEO_GPIO_UP_INT_N       90
 #define LEO_GPIO_TS_POWER       160
@@ -323,6 +326,18 @@ enum {
 };
 
 /* idle levels of input pins as set by board pull-ups */
+static DeviceState *leo_gpio_dev;
+
+/* TLMM setup from the kernel: only the Wi-Fi power pin needs a direction */
+static void leo_tlmm(uint32_t cfg)
+{
+    int gpio = (cfg >> 4) & 0x3ff, func = cfg & 0xf, dir = (cfg >> 14) & 1;
+
+    if (gpio == LEO_GPIO_WIFI_SHUTDOWN_N && func == 0 && leo_gpio_dev) {
+        msm_gpio_set_direction(leo_gpio_dev, gpio, dir);
+    }
+}
+
 static void leo_gpio_defaults(DeviceState *gpio)
 {
     bool have_sd = drive_get(IF_SD, 0, 0) != NULL;
@@ -598,7 +613,7 @@ static void htc_leo_init(MachineState *machine)
                            qdev_get_gpio_in(s->vic, INT_MDP));
     }
 
-    /* SDC1: Wi-Fi SDIO slot (no card yet), SDC2: microSD slot */
+    /* SDC1: Wi-Fi SDIO slot (BCM4329), SDC2: microSD slot */
     {
         static const struct { hwaddr base; int irq0, irq1; } sdc[] = {
             { MSM_SDC1_PHYS, INT_SDC1_0, INT_SDC1_1 },
@@ -612,6 +627,15 @@ static void htc_leo_init(MachineState *machine)
                                qdev_get_gpio_in(s->vic, sdc[i].irq0));
             sysbus_connect_irq(SYS_BUS_DEVICE(d), 1,
                                qdev_get_gpio_in(s->vic, sdc[i].irq1));
+            if (i == 0) {
+                qemu_irq power;
+                leo_gpio_dev = s->gpio;
+                leo_tlmm_config = leo_tlmm;
+                leo_bcm4329_init(d, qdev_get_gpio_in(s->gpio, LEO_GPIO_WIFI_IRQ),
+                                 &power, qemu_find_netdev("wifi"));
+                qdev_connect_gpio_out_named(s->gpio, "out",
+                                            LEO_GPIO_WIFI_SHUTDOWN_N, power);
+            }
             if (i == 1) {
                 DriveInfo *di = drive_get(IF_SD, 0, 0);
                 if (di) {

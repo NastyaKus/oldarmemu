@@ -108,6 +108,9 @@ DeviceState *msm_stub_create(const char *name, hwaddr base, uint64_t size,
 
 /* Set the idle level of an input GPIO pin (pull-up/down on the board). */
 void msm_gpio_set_default(DeviceState *dev, int n, bool level);
+void msm_gpio_set_direction(DeviceState *dev, int n, bool output);
+/* board hook for PCOM_RPC_GPIO_TLMM_CONFIG_EX (PCOM_GPIO_CFG word) */
+extern void (*leo_tlmm_config)(uint32_t cfg);
 
 /* NAND page as Linux sees it: 2048 data bytes + 16 free OOB bytes. */
 bool msm_nand_read_page(DeviceState *dev, uint32_t page, uint8_t *data,
@@ -142,5 +145,15 @@ void leo_set_key(int key, bool down);
 
 /* Set the value a stub register holds after reset (bootloader state). */
 void msm_stub_preset(DeviceState *dev, hwaddr off, uint32_t val);
+
+/* SDIO card on an SDCC slot (msm_sdcc.c); the card streams CMD53 data */
+typedef struct MsmSdioOps {
+    /* false: no response (timeout); *resp: the 32-bit R4/R5/R6/R1 value */
+    bool (*command)(void *opaque, uint8_t cmd, uint32_t arg, uint32_t *resp);
+    void (*read)(void *opaque, uint8_t *buf, unsigned len);
+    void (*write)(void *opaque, const uint8_t *buf, unsigned len);
+} MsmSdioOps;
+void msm_sdcc_attach_sdio(DeviceState *sdcc, const MsmSdioOps *ops,
+                          void *opaque);
 
 #endif

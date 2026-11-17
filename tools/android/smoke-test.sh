@@ -18,7 +18,7 @@ TMPDIR="$D" timeout 90 ./libqemu-leo.so -L "$D/qemu-data" \
     -M htc-leo,nand-size=1024,system-size=300,cache-size=44,reboot-file="$D/reboot.txt",hostlink="$D/hostlink.shm",pin-cpu=on \
     -accel tcg,tb-size=256 -nodefaults \
     -drive if=mtd,format=raw,file="$D/nand.img" -drive if=sd,format=raw,file="$SD" \
-    -display none -qmp unix:"$D/qmp.sock",server=on,wait=off \
+    -display none -qmp unix:"$D/qmp.sock",server=on,wait=off -netdev user,id=wifi \
     -serial file:"$D/console.log" -monitor none -kernel "$1" > qemu.log 2>&1 &
 sleep 40
 # the recovery menu must reach the shared frame buffer, and a key sent

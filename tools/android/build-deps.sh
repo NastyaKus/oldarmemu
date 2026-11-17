@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Cross-compile QEMU's dependencies (libffi, pcre2, glib, pixman) for Android.
+# Cross-compile QEMU's dependencies (libffi, pcre2, glib, pixman, libslirp)
+# for Android.
 #   ABI=arm64-v8a|x86_64  NDK=/path/to/ndk  build-deps.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -65,6 +66,8 @@ build_meson() {   # tarball dir args...
     local tb="$1" dir="$2"; shift 2
     [ -f "$PREFIX/.done-$dir" ] && return
     rm -rf "$WORK/$dir" && tar -C "$WORK" -xf "$tb"
+    [ -f "$ROOT/tools/android/patches/$dir.patch" ] && \
+        patch -d "$WORK/$dir" -p1 < "$ROOT/tools/android/patches/$dir.patch"
     (cd "$WORK/$dir" && meson setup _build --cross-file "$CROSS" \
         --prefix="$PREFIX" --libdir=lib -Ddefault_library=static \
         --buildtype=release "$@" > setup.log && \
@@ -83,4 +86,6 @@ build_meson "$(fetch https://download.gnome.org/sources/glib/2.82/glib-2.82.5.ta
     -Dinstalled_tests=false
 build_meson "$(fetch https://cairographics.org/releases/pixman-0.44.2.tar.gz)" \
     pixman-0.44.2 -Dtests=disabled -Dgtk=disabled -Dlibpng=disabled -Ddemos=disabled
+build_meson "$(fetch https://gitlab.freedesktop.org/slirp/libslirp/-/archive/v4.8.0/libslirp-v4.8.0.tar.gz)" \
+    libslirp-v4.8.0
 echo "deps for $ABI installed in $PREFIX"

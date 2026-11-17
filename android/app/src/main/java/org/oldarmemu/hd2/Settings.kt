@@ -26,6 +26,9 @@ class Settings(ctx: Context) {
     var tbSize by int("tb_size", 256)                   // MiB of translated code
     var pinCpu by bool("pin_cpu", true)
 
+    /* network */
+    var wifi by bool("wifi", true)                       // emulated BCM4329 + NAT
+
     /* storage */
     var sdSizeMb by int("sd_size", 1024)
 

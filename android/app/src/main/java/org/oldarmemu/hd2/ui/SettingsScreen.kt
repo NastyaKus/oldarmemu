@@ -93,6 +93,13 @@ fun SettingsScreen(
                 "Держать эмулятор на самых быстрых ядрах", cfg.pinCpu) { cfg.pinCpu = it }
         }
 
+        SectionHeader("Сеть")
+        SettingsGroup {
+            SwitchRow(Hd2Icons.Wifi, "Wi‑Fi через интернет телефона",
+                "В HD2 включите Wi‑Fi и подключитесь к сети «HD2-Emulator»",
+                cfg.wifi) { cfg.wifi = it }
+        }
+
         SectionHeader("Память и файлы")
         SettingsGroup {
             ClickRow(Hd2Icons.Memory, "Разметка NAND", st.nandLayout().label) { layoutDialog = true }

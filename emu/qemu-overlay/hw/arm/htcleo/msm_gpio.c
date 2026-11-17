@@ -286,6 +286,26 @@ void msm_gpio_set_default(DeviceState *dev, int n, bool level)
     }
 }
 
+/* TLMM configured the pin as a GPIO output (or input) through proc_comm */
+void msm_gpio_set_direction(DeviceState *dev, int n, bool output)
+{
+    MsmGpioState *s = MSM_GPIO(dev);
+    int b = 0;
+
+    if (n >= MSM_GPIO_NUM) {
+        return;
+    }
+    while (n >= bank_start[b + 1]) {
+        b++;
+    }
+    uint32_t m = 1u << (n - bank_start[b]);
+    uint32_t old_out = s->out_val[b], old_oe = s->oe[b], old_in = bank_in(s, b);
+    s->oe[b] = output ? s->oe[b] | m : s->oe[b] & ~m;
+    gpio_drive_outputs(s, b, old_out, old_oe);
+    gpio_pin_changed(s, b, old_in);
+    gpio_update(s);
+}
+
 static void gpio_reset(DeviceState *dev)
 {
     MsmGpioState *s = MSM_GPIO(dev);

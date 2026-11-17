@@ -80,7 +80,25 @@ struct MsmSdccState {
     uint32_t remaining;         /* bytes left in the current transfer */
     uint32_t status;            /* latched (static) status bits */
     uint32_t mask[2];
+
+    /* an SDIO card wired to this slot instead of the SD bus */
+    const MsmSdioOps *sdio;
+    void *sdio_opaque;
 };
+
+void msm_sdcc_attach_sdio(DeviceState *dev, const MsmSdioOps *ops,
+                          void *opaque)
+{
+    MsmSdccState *s = MSM_SDCC(dev);
+
+    s->sdio = ops;
+    s->sdio_opaque = opaque;
+}
+
+static bool card_data_ready(MsmSdccState *s)
+{
+    return s->sdio ? true : sdbus_data_ready(&s->sdbus);
+}
 
 static int sdcc_trace = -1;
 
@@ -96,7 +114,7 @@ static uint32_t sdcc_status(MsmSdccState *s)
     if (data_active(s)) {
         if (s->datactrl & DPSM_DIRECTION) {
             st |= ST_RXACTIVE;
-            if (sdbus_data_ready(&s->sdbus)) {
+            if (card_data_ready(s)) {
                 st |= ST_RXDATAAVLBL | ST_RXFIFOHALFFULL;
             } else {
                 st |= ST_RXFIFOEMPTY;
@@ -136,7 +154,13 @@ static void sdcc_do_command(MsmSdccState *s)
 
     req.cmd = s->cmd & CMD_INDEX;
     req.arg = s->arg;
-    rlen = sdbus_do_command(&s->sdbus, &req, resp, sizeof(resp));
+    if (s->sdio) {
+        uint32_t r = 0;
+        rlen = s->sdio->command(s->sdio_opaque, req.cmd, req.arg, &r) ? 4 : 0;
+        stl_be_p(resp, r);
+    } else {
+        rlen = sdbus_do_command(&s->sdbus, &req, resp, sizeof(resp));
+    }
     s->respcmd = req.cmd;
     if (sdcc_trace < 0) {
         sdcc_trace = getenv("SDCC_TRACE") != NULL;
@@ -173,8 +197,12 @@ static uint32_t sdcc_fifo_read(MsmSdccState *s, unsigned size)
     uint32_t n = MIN(size, s->remaining);
 
     if (data_active(s) && (s->datactrl & DPSM_DIRECTION) &&
-        sdbus_data_ready(&s->sdbus)) {
-        sdbus_read_data(&s->sdbus, buf, n);
+        card_data_ready(s)) {
+        if (s->sdio) {
+            s->sdio->read(s->sdio_opaque, buf, n);
+        } else {
+            sdbus_read_data(&s->sdbus, buf, n);
+        }
         sdcc_data_progress(s, n);
     }
     return ldl_le_p(buf);
@@ -187,7 +215,11 @@ static void sdcc_fifo_write(MsmSdccState *s, uint32_t val, unsigned size)
 
     if (data_active(s) && !(s->datactrl & DPSM_DIRECTION)) {
         stl_le_p(buf, val);
-        sdbus_write_data(&s->sdbus, buf, n);
+        if (s->sdio) {
+            s->sdio->write(s->sdio_opaque, buf, n);
+        } else {
+            sdbus_write_data(&s->sdbus, buf, n);
+        }
         sdcc_data_progress(s, n);
         if (!s->remaining) {
             s->status |= ST_PROGDONE;

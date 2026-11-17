@@ -1,0 +1,20 @@
+--- a/src/slirp.c
++++ b/src/slirp.c
+@@ -363,7 +363,16 @@
+ #if defined(__HAIKU__)
+ #define RESOLV_CONF_PATH "/boot/system/settings/network/resolv.conf"
+ #else
+-#define RESOLV_CONF_PATH "/etc/resolv.conf"
++/*
++ * Android has no /etc/resolv.conf: let the embedding app point at a file
++ * listing the phone's DNS servers.
++ */
++static const char *resolv_conf_path(void)
++{
++    const char *p = getenv("SLIRP_RESOLV_CONF");
++    return p && *p ? p : "/etc/resolv.conf";
++}
++#define RESOLV_CONF_PATH resolv_conf_path()
+ #endif
+ 
+ static int get_dns_addr_cached(void *pdns_addr, void *cached_addr,

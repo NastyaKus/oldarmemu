@@ -119,6 +119,9 @@ enum {
 #define PCOM_RESET_CHIP         3
 #define PCOM_POWER_DOWN         10
 #define PCOM_RESET_CHIP_IMM     42
+#define PCOM_RPC_GPIO_TLMM_CONFIG_EX 37
+
+void (*leo_tlmm_config)(uint32_t cfg);
 
 /* ---- WinCE DEX interface ---- */
 #define DEX_BASE                0xEFE00
@@ -257,6 +260,11 @@ static void a9_handle_proc_comm(MsmA9State *s)
         break;
     case PCOM_POWER_DOWN:
         leo_request_power_off();
+        break;
+    case PCOM_RPC_GPIO_TLMM_CONFIG_EX:
+        if (leo_tlmm_config) {
+            leo_tlmm_config(d1);
+        }
         break;
     }
 }
