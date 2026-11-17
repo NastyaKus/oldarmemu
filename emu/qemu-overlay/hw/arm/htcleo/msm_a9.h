@@ -62,6 +62,10 @@ struct MsmA9State {
     GArray *events;         /* A9PendingEvt, sorted by time */
     QEMUTimer *smd_timer;
     bool smd_renamed;
+
+    /* snapshot of the state above that VMState fields cannot express */
+    uint32_t vm_len;
+    uint8_t *vm_buf;
 };
 
 static inline uint32_t smem_rd(MsmA9State *s, uint32_t off)
@@ -80,5 +84,7 @@ void a9_smd_init(MsmA9State *s);
 void a9_smd_reset(MsmA9State *s);
 void a9_smd_kick(MsmA9State *s);
 void a9_smd_timer_cb(void *opaque);
+void a9_smd_save(MsmA9State *s);
+void a9_smd_load(MsmA9State *s);
 
 #endif

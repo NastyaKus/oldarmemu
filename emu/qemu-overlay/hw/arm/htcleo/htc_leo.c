@@ -32,6 +32,7 @@
 #include "target/arm/cpu-qom.h"
 #include "cpu.h"
 #include "msm.h"
+#include "migration/vmstate.h"
 #include "adreno.h"
 #include "leo_boot.h"
 #include "leo_bcm4329.h"
@@ -346,6 +347,20 @@ enum {
 
 /* idle levels of input pins as set by board pull-ups */
 static DeviceState *leo_gpio_dev;
+
+/* board state that is not in a device: ram_console mirror, buttons */
+static const VMStateDescription vmstate_htc_leo = {
+    .name = "htc-leo-board",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(keys_down, HtcLeoMachineState),
+        VMSTATE_BOOL_ARRAY(kp_col_level, HtcLeoMachineState, 3),
+        VMSTATE_UINT32(rc_last, HtcLeoMachineState),
+        VMSTATE_BOOL(rc_seen, HtcLeoMachineState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 /* TLMM setup from the kernel: only the Wi-Fi power pin needs a direction */
 static void leo_tlmm(uint32_t cfg)
@@ -680,6 +695,7 @@ static void htc_leo_init(MachineState *machine)
         qemu_input_handler_register(DEVICE(s->gpio), &leo_kbd_handler));
 
     leo_map_stubs();
+    vmstate_register(NULL, 0, &vmstate_htc_leo, s);
 
     /* ram_console mirror */
     chr = serial_hd(0);

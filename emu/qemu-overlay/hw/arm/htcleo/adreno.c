@@ -27,6 +27,7 @@
 #include "migration/vmstate.h"
 #include "qemu/main-loop.h"
 #include "qemu/rcu.h"
+#include "system/runstate.h"
 #include "adreno.h"
 
 /* ---- registers (dword offsets) ---- */
@@ -937,8 +938,11 @@ static void *adreno_thread(void *opaque)
             break;
         }
         qemu_mutex_lock(&s->lock);
-        cp_run(s);
-        bool idle = qatomic_read(&s->regs[REG_CP_RB_RPTR]) ==
+        if (!s->paused) {
+            cp_run(s);
+        }
+        bool idle = s->paused ||
+                    qatomic_read(&s->regs[REG_CP_RB_RPTR]) ==
                     (qatomic_read(&s->regs[REG_CP_RB_WPTR]) &
                      ((2u << (s->regs[REG_CP_RB_CNTL] & 0x3f)) - 1)) ||
                     (s->regs[REG_CP_ME_CNTL] & 0x10000000);
@@ -967,6 +971,54 @@ static void adreno_reset(DeviceState *dev)
     qemu_set_irq(s->irq, 0);
 }
 
+/*
+ * The GPU thread must not touch guest memory or device state while the VM
+ * is stopped (snapshots save both): taking the lock waits for the command
+ * stream segment in progress.
+ */
+static void adreno_vm_state(void *opaque, bool running, RunState state)
+{
+    AdrenoState *s = opaque;
+
+    qemu_mutex_lock(&s->lock);
+    s->paused = !running;
+    qemu_mutex_unlock(&s->lock);
+    if (running) {
+        qemu_event_set(&s->kick);
+    }
+}
+
+static int adreno_post_load(void *opaque, int version_id)
+{
+    AdrenoState *s = opaque;
+
+    adreno_tlb_flush(s);
+    s->fault_reported = false;
+    adreno_draw_post_load(s);
+    qemu_set_irq(s->irq, adreno_irq_signal(s) != 0);
+    return 0;
+}
+
+static const VMStateDescription vmstate_adreno = {
+    .name = "adreno",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = adreno_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32_ARRAY(regs, AdrenoState, ADRENO_NREGS),
+        VMSTATE_UINT32_ARRAY(istore, AdrenoState, ADRENO_ISTORE_DWORDS),
+        VMSTATE_UINT32_ARRAY(im_start, AdrenoState, 3),
+        VMSTATE_UINT32_ARRAY(im_size, AdrenoState, 3),
+        VMSTATE_UINT32(bin_mask, AdrenoState),
+        VMSTATE_UINT32(bin_select, AdrenoState),
+        VMSTATE_UINT32_ARRAY(shadow_base, AdrenoState, 5),
+        VMSTATE_BOOL_ARRAY(shadow_en, AdrenoState, 5),
+        VMSTATE_BUFFER(gmem, AdrenoState),
+        VMSTATE_UINT64(draws, AdrenoState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static void adreno_realize(DeviceState *dev, Error **errp)
 {
     AdrenoState *s = ADRENO(dev);
@@ -974,6 +1026,8 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     qemu_mutex_init(&s->lock);
     qemu_event_init(&s->kick, false);
     s->irq_bh = qemu_bh_new(adreno_irq_bh, s);
+    s->paused = !runstate_is_running();
+    qemu_add_vm_change_state_handler(adreno_vm_state, s);
     qemu_thread_create(&s->thread, "adreno-cp", adreno_thread, s,
                        QEMU_THREAD_JOINABLE);
 }
@@ -1002,6 +1056,7 @@ static void adreno_class_init(ObjectClass *oc, const void *data)
 
     device_class_set_legacy_reset(dc, adreno_reset);
     dc->realize = adreno_realize;
+    dc->vmsd = &vmstate_adreno;
     dc->desc = "Adreno 200 GPU";
 }
 

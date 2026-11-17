@@ -33,6 +33,8 @@
 #include "net/net.h"
 #include "msm.h"
 #include "leo_bcm4329.h"
+#include "leo_vmblob.h"
+#include "migration/vmstate.h"
 
 /* ---- chip layout ---- */
 #define SI_ENUM_BASE        0x18000000u
@@ -212,6 +214,10 @@ struct LeoWifi {
     NICState *nic;
     NICConf conf;
     MemReentrancyGuard guard;
+
+    /* snapshot */
+    uint32_t vm_len;
+    uint8_t *vm_buf;
 };
 
 static int trace = -1;
@@ -1216,6 +1222,177 @@ static void wifi_power(void *opaque, int n, int level)
     }
 }
 
+/* ---------------- snapshots ---------------- */
+
+static void ht_save(gpointer k, gpointer v, gpointer b)
+{
+    blob_u32(b, GPOINTER_TO_UINT(k));
+    blob_u32(b, GPOINTER_TO_UINT(v));
+}
+
+static void iovar_save(gpointer k, gpointer v, gpointer b)
+{
+    blob_bytes(b, k, strlen(k) + 1);
+    blob_u32(b, GPOINTER_TO_INT(v));
+}
+
+static uint64_t timer_when(QEMUTimer *t)
+{
+    return timer_pending(t) ? timer_expire_time_ns(t) : (uint64_t)-1;
+}
+
+static int wifi_pre_save(void *opaque)
+{
+    LeoWifi *s = opaque;
+    GByteArray *b = g_byte_array_new();
+
+    blob_u32(b, 1);                             /* format */
+    blob_u32(b, s->powered);
+    blob_u32(b, s->ioen | s->inten << 8 | s->bus_if << 16 | s->speed << 24);
+    blob_u32(b, s->sepint);
+    for (int i = 0; i < 3; i++) {
+        blob_u32(b, s->blksz[i]);
+    }
+    blob_u32(b, s->xfn);
+    blob_u32(b, s->xwrite);
+    blob_u32(b, s->xaddr);
+    blob_u32(b, s->xpos);
+    blob_bytes(b, s->xbuf, s->xbuf ? s->xlen : 0);
+    blob_u32(b, s->xlen);
+    blob_u32(b, s->sbwin);
+    blob_u32(b, s->clkcsr | s->devctl << 8 | s->watermark << 16 | s->pullup << 24);
+    blob_u32(b, s->fw_running);
+    blob_u32(b, s->intstatus);
+    blob_u32(b, s->hostintmask);
+    blob_u32(b, g_hash_table_size(s->regs));
+    g_hash_table_foreach(s->regs, ht_save, b);
+    blob_u32(b, g_queue_get_length(&s->rxq));
+    for (GList *l = s->rxq.head; l; l = l->next) {
+        GByteArray *f = l->data;
+        blob_bytes(b, f->data, f->len);
+    }
+    blob_bytes(b, s->rxcur ? s->rxcur->data : NULL, s->rxcur ? s->rxcur->len : 0);
+    blob_u32(b, s->rxcur != NULL);
+    blob_u32(b, s->rxpos);
+    blob_bytes(b, s->txacc->data, s->txacc->len);
+    blob_u32(b, s->rx_seq | s->host_seq << 8 | s->window_sent << 16);
+    blob_bytes(b, s->mac, 6);
+    blob_u32(b, s->up | s->associated << 1);
+    blob_bytes(b, s->eventmask, sizeof(s->eventmask));
+    blob_u32(b, g_hash_table_size(s->iovars));
+    g_hash_table_foreach(s->iovars, iovar_save, b);
+    blob_u32(b, s->scan_pending);
+    blob_u64(b, timer_when(s->timer));
+    blob_u64(b, timer_when(s->join_timer));
+    blob_finish(b, &s->vm_len, &s->vm_buf);
+    return 0;
+}
+
+static void timer_restore(QEMUTimer *t, uint64_t when)
+{
+    if (when == (uint64_t)-1) {
+        timer_del(t);
+    } else {
+        timer_mod_ns(t, when);
+    }
+}
+
+static int wifi_post_load(void *opaque, int version_id)
+{
+    LeoWifi *s = opaque;
+    BlobReader r = { s->vm_buf, s->vm_len };
+    const uint8_t *p;
+    uint32_t n, len, v;
+
+    if (!s->vm_buf || blob_get_u32(&r) != 1) {
+        return -EINVAL;
+    }
+    wifi_reset_card(s);
+    s->powered = blob_get_u32(&r);
+    v = blob_get_u32(&r);
+    s->ioen = v; s->inten = v >> 8; s->bus_if = v >> 16; s->speed = v >> 24;
+    s->sepint = blob_get_u32(&r);
+    for (int i = 0; i < 3; i++) {
+        s->blksz[i] = blob_get_u32(&r);
+    }
+    s->xfn = blob_get_u32(&r);
+    s->xwrite = blob_get_u32(&r);
+    s->xaddr = blob_get_u32(&r);
+    s->xpos = blob_get_u32(&r);
+    p = blob_get_bytes(&r, &len);
+    s->xlen = blob_get_u32(&r);
+    s->xbuf = g_realloc(s->xbuf, MAX(s->xlen, 1));
+    if (len == s->xlen && p) {
+        memcpy(s->xbuf, p, len);
+    }
+    s->sbwin = blob_get_u32(&r);
+    v = blob_get_u32(&r);
+    s->clkcsr = v; s->devctl = v >> 8; s->watermark = v >> 16; s->pullup = v >> 24;
+    s->fw_running = blob_get_u32(&r);
+    s->intstatus = blob_get_u32(&r);
+    s->hostintmask = blob_get_u32(&r);
+    n = blob_get_u32(&r);
+    for (uint32_t i = 0; i < n && !r.bad; i++) {
+        uint32_t k = blob_get_u32(&r);
+        bp_set(s, k, blob_get_u32(&r));
+    }
+    n = blob_get_u32(&r);
+    for (uint32_t i = 0; i < n && !r.bad; i++) {
+        p = blob_get_bytes(&r, &len);
+        g_queue_push_tail(&s->rxq, g_byte_array_append(g_byte_array_new(), p, len));
+    }
+    p = blob_get_bytes(&r, &len);
+    if (blob_get_u32(&r)) {
+        s->rxcur = g_byte_array_append(g_byte_array_new(), p, len);
+    }
+    s->rxpos = blob_get_u32(&r);
+    p = blob_get_bytes(&r, &len);
+    g_byte_array_append(s->txacc, p, len);
+    v = blob_get_u32(&r);
+    s->rx_seq = v; s->host_seq = v >> 8; s->window_sent = v >> 16;
+    p = blob_get_bytes(&r, &len);
+    if (len == 6) {
+        memcpy(s->mac, p, 6);
+    }
+    v = blob_get_u32(&r);
+    s->up = v & 1;
+    s->associated = v & 2;
+    p = blob_get_bytes(&r, &len);
+    if (len == sizeof(s->eventmask)) {
+        memcpy(s->eventmask, p, len);
+    }
+    n = blob_get_u32(&r);
+    for (uint32_t i = 0; i < n && !r.bad; i++) {
+        p = blob_get_bytes(&r, &len);
+        v = blob_get_u32(&r);
+        if (p && len && !p[len - 1]) {
+            g_hash_table_insert(s->iovars, g_strdup((const char *)p),
+                                GINT_TO_POINTER(v));
+        }
+    }
+    s->scan_pending = blob_get_u32(&r);
+    timer_restore(s->timer, blob_get_u64(&r));
+    timer_restore(s->join_timer, blob_get_u64(&r));
+    g_free(s->vm_buf);
+    s->vm_buf = NULL;
+    s->vm_len = 0;
+    wifi_update_irq(s);
+    return r.bad ? -EINVAL : 0;
+}
+
+static const VMStateDescription vmstate_bcm4329 = {
+    .name = "leo-bcm4329",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = wifi_pre_save,
+    .post_load = wifi_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(vm_len, LeoWifi),
+        VMSTATE_VBUFFER_ALLOC_UINT32(vm_buf, LeoWifi, 0, NULL, vm_len),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 LeoWifi *leo_bcm4329_init(DeviceState *sdcc, qemu_irq oob, qemu_irq *power_in,
                           NetClientState *peer)
 {
@@ -1239,5 +1416,6 @@ LeoWifi *leo_bcm4329_init(DeviceState *sdcc, qemu_irq oob, qemu_irq *power_in,
     wifi_reset_card(s);
     msm_sdcc_attach_sdio(sdcc, &wifi_sdio_ops, s);
     *power_in = qemu_allocate_irq(wifi_power, s, 0);
+    vmstate_register(NULL, 0, &vmstate_bcm4329, s);
     return s;
 }

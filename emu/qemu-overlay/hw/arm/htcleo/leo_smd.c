@@ -24,6 +24,7 @@
 #include "system/rtc.h"
 #include "system/address-spaces.h"
 #include "msm_a9.h"
+#include "leo_vmblob.h"
 
 /* SMEM item ids (CONFIG_MSM_N_WAY_SMD numbering) */
 #define SMEM_CHANNEL_ALLOC_TBL  13
@@ -147,6 +148,110 @@ static const struct {
 
 /* modem RTC = QEMU's RTC (host clock, -rtc base=...) + what the guest set */
 static time_t rtc_offset;
+
+/* ---------------- snapshots ---------------- */
+
+void a9_smd_save(MsmA9State *s)
+{
+    GByteArray *b = g_byte_array_new();
+
+    blob_u32(b, s->smd_renamed);
+    blob_u64(b, rtc_offset);
+    blob_u32(b, s->nsmd);
+    for (int i = 0; i < s->nsmd; i++) {
+        blob_bytes(b, s->smd[i].rx->data, s->smd[i].rx->len);
+        blob_bytes(b, s->smd[i].tx->data, s->smd[i].tx->len);
+    }
+    blob_u32(b, A9_DAL_MAX_CLIENTS);
+    for (int i = 0; i < A9_DAL_MAX_CLIENTS; i++) {
+        A9DalClient *d = &s->dal[i];
+        blob_u32(b, d->used);
+        blob_u32(b, d->chan);
+        blob_u32(b, d->apps_ptr);
+        blob_u32(b, d->device_id);
+        blob_u32(b, d->cb_evt);
+        blob_u32(b, d->loc_evt);
+        blob_u32(b, d->session);
+        blob_u64(b, d->busy_until);
+        blob_u32(b, d->rate);
+        blob_u32(b, d->channels);
+        blob_u32(b, d->playback);
+    }
+    blob_u32(b, s->events->len);
+    for (guint i = 0; i < s->events->len; i++) {
+        A9PendingEvt *e = &g_array_index(s->events, A9PendingEvt, i);
+        blob_u64(b, e->when);
+        blob_u32(b, e->client);
+        blob_u32(b, e->event_id);
+    }
+    blob_u64(b, timer_pending(s->smd_timer) ?
+                timer_expire_time_ns(s->smd_timer) : (uint64_t)-1);
+    blob_finish(b, &s->vm_len, &s->vm_buf);
+}
+
+void a9_smd_load(MsmA9State *s)
+{
+    BlobReader r = { s->vm_buf, s->vm_len };
+    uint32_t n, len;
+    const uint8_t *p;
+    uint64_t when;
+
+    if (!s->vm_buf) {
+        return;
+    }
+    s->smd_renamed = blob_get_u32(&r);
+    rtc_offset = blob_get_u64(&r);
+    n = blob_get_u32(&r);
+    for (uint32_t i = 0; i < n; i++) {
+        A9SmdChan *c = i < (uint32_t)s->nsmd ? &s->smd[i] : NULL;
+        p = blob_get_bytes(&r, &len);
+        if (c) {
+            g_byte_array_set_size(c->rx, 0);
+            g_byte_array_append(c->rx, p, len);
+        }
+        p = blob_get_bytes(&r, &len);
+        if (c) {
+            g_byte_array_set_size(c->tx, 0);
+            g_byte_array_append(c->tx, p, len);
+        }
+    }
+    n = blob_get_u32(&r);
+    for (uint32_t i = 0; i < n; i++) {
+        A9DalClient d;
+        d.used = blob_get_u32(&r);
+        d.chan = blob_get_u32(&r);
+        d.apps_ptr = blob_get_u32(&r);
+        d.device_id = blob_get_u32(&r);
+        d.cb_evt = blob_get_u32(&r);
+        d.loc_evt = blob_get_u32(&r);
+        d.session = blob_get_u32(&r);
+        d.busy_until = blob_get_u64(&r);
+        d.rate = blob_get_u32(&r);
+        d.channels = blob_get_u32(&r);
+        d.playback = blob_get_u32(&r);
+        if (i < A9_DAL_MAX_CLIENTS) {
+            s->dal[i] = d;
+        }
+    }
+    n = blob_get_u32(&r);
+    g_array_set_size(s->events, 0);
+    for (uint32_t i = 0; i < n && !r.bad; i++) {
+        A9PendingEvt e;
+        e.when = blob_get_u64(&r);
+        e.client = blob_get_u32(&r);
+        e.event_id = blob_get_u32(&r);
+        g_array_append_val(s->events, e);
+    }
+    when = blob_get_u64(&r);
+    if (when != (uint64_t)-1 && !r.bad) {
+        timer_mod(s->smd_timer, when);
+    } else {
+        timer_del(s->smd_timer);
+    }
+    g_free(s->vm_buf);
+    s->vm_buf = NULL;
+    s->vm_len = 0;
+}
 
 /*
  * Fill the results of a call; returns their size.  args/argn: the XDR

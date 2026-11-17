@@ -66,6 +66,7 @@ struct AdrenoState {
     QemuEvent kick;
     QEMUBH *irq_bh;
     bool quit;
+    bool paused;                /* the VM is stopped: the GPU stops too */
 };
 
 #define ADRENO_REG_ALU          0x4000
@@ -109,6 +110,7 @@ void adreno_write(AdrenoState *s, uint32_t va, const void *buf, uint32_t len);
 
 /* adreno_draw.c */
 void adreno_draw_reset(AdrenoState *s);
+void adreno_draw_post_load(AdrenoState *s);
 void adreno_reg_written(AdrenoState *s, uint32_t reg, uint32_t val);
 void adreno_event(AdrenoState *s, uint32_t event);
 void adreno_draw(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n);

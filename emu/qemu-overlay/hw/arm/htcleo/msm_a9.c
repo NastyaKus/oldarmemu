@@ -450,13 +450,29 @@ static void a9_init(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), a9_wake_apps, "wake", 1);
 }
 
+static int a9_pre_save(void *opaque)
+{
+    a9_smd_save(opaque);
+    return 0;
+}
+
+static int a9_post_load(void *opaque, int version_id)
+{
+    a9_smd_load(opaque);
+    return 0;
+}
+
 static const VMStateDescription vmstate_msm_a9 = {
     .name = "msm-a9-hle",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .pre_save = a9_pre_save,
+    .post_load = a9_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(heap_free, MsmA9State),
         VMSTATE_UINT32(dex_count, MsmA9State),
+        VMSTATE_UINT32(vm_len, MsmA9State),
+        VMSTATE_VBUFFER_ALLOC_UINT32(vm_buf, MsmA9State, 0, NULL, vm_len),
         VMSTATE_END_OF_LIST()
     }
 };

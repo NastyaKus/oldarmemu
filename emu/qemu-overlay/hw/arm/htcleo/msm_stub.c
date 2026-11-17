@@ -17,6 +17,8 @@
 #include "hw/sysbus.h"
 #include "hw/qdev-properties.h"
 #include "msm.h"
+#include "leo_vmblob.h"
+#include "migration/vmstate.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(MsmStubState, MSM_STUB)
 
@@ -37,6 +39,8 @@ struct MsmStubState {
     GHashTable *regs;
     GHashTable *presets;   /* offset -> reset value */
     GHashTable *selfclear; /* offset -> bits that always read as 0 */
+    uint32_t vm_len;       /* snapshot of the register values */
+    uint8_t *vm_buf;
 };
 
 static StubReg *stub_reg(MsmStubState *s, hwaddr off)
@@ -144,6 +148,50 @@ void msm_stub_selfclear(DeviceState *dev, hwaddr off, uint32_t mask)
                         GUINT_TO_POINTER(mask));
 }
 
+static int stub_pre_save(void *opaque)
+{
+    MsmStubState *s = opaque;
+    GByteArray *b = g_byte_array_new();
+    GHashTableIter it;
+    gpointer k, v;
+
+    g_hash_table_iter_init(&it, s->regs);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        blob_u32(b, GPOINTER_TO_UINT(k));
+        blob_u32(b, ((StubReg *)v)->val);
+    }
+    blob_finish(b, &s->vm_len, &s->vm_buf);
+    return 0;
+}
+
+static int stub_post_load(void *opaque, int version_id)
+{
+    MsmStubState *s = opaque;
+    BlobReader r = { s->vm_buf, s->vm_len };
+
+    while (r.left >= 8) {
+        uint32_t off = blob_get_u32(&r);
+        stub_reg(s, off)->val = blob_get_u32(&r);
+    }
+    g_free(s->vm_buf);
+    s->vm_buf = NULL;
+    s->vm_len = 0;
+    return 0;
+}
+
+static const VMStateDescription vmstate_msm_stub = {
+    .name = "msm-stub",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .pre_save = stub_pre_save,
+    .post_load = stub_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(vm_len, MsmStubState),
+        VMSTATE_VBUFFER_ALLOC_UINT32(vm_buf, MsmStubState, 0, NULL, vm_len),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
 static const Property stub_props[] = {
     DEFINE_PROP_STRING("name", MsmStubState, name),
     DEFINE_PROP_UINT64("size", MsmStubState, size, 0x1000),
@@ -157,6 +205,7 @@ static void stub_class_init(ObjectClass *oc, const void *data)
     dc->realize = stub_realize;
     device_class_set_legacy_reset(dc, stub_reset);
     device_class_set_props(dc, stub_props);
+    dc->vmsd = &vmstate_msm_stub;
     dc->user_creatable = false;
 }
 

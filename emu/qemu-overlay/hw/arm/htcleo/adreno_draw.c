@@ -2291,6 +2291,12 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
 
 /* ---------------- entry points ---------------- */
 
+/* state was loaded (snapshot): drop caches derived from the old state */
+void adreno_draw_post_load(AdrenoState *s)
+{
+    tic_valid = 0;
+}
+
 void adreno_draw_reset(AdrenoState *s)
 {
     s->draws = 0;
