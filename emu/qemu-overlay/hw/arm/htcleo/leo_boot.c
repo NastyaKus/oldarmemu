@@ -69,7 +69,14 @@ static char *write_tmp(const uint8_t *data, size_t len, const char *tmpl,
 static void set_cmdline(MachineState *m, const char *from_image)
 {
     const char *user = m->kernel_cmdline ? m->kernel_cmdline : "";
-    char *cl = g_strstrip(g_strdup_printf("%s %s", from_image, user));
+    /*
+     * Android's init lowers the console log level to 3 right after boot,
+     * which hides KERN_ERR reports (KGSL hangs, SDCC errors) from the
+     * ram_console mirror the app saves as console.log.  Keep them.
+     */
+    const char *extra = strstr(from_image, "ignore_loglevel") ||
+                        strstr(user, "ignore_loglevel") ? "" : "ignore_loglevel";
+    char *cl = g_strstrip(g_strdup_printf("%s %s %s", from_image, user, extra));
 
     g_free(m->kernel_cmdline);
     m->kernel_cmdline = cl;

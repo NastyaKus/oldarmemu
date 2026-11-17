@@ -276,6 +276,12 @@ void adreno_wr32(AdrenoState *s, uint32_t va, uint32_t val)
     hwaddr pa;
 
     if (adreno_xlate(s, va, &pa)) {
+        /*
+         * CP writes (timestamps, read pointer, scratch shadows) tell the
+         * CPU that earlier GPU output is ready: on weakly ordered hosts
+         * (ARM64 phones) the pixels must be visible first.
+         */
+        smp_wmb();
         stl_le_phys(&address_space_memory, pa, val);
         if (adreno_watch) {
             uint8_t b[4];
@@ -309,6 +315,7 @@ void adreno_write(AdrenoState *s, uint32_t va, const void *buf, uint32_t len)
 {
     const uint8_t *p = buf;
 
+    smp_wmb();                          /* see adreno_wr32 */
     while (len) {
         uint32_t n = MIN(len, 4096 - (va & 4095));
         hwaddr pa;
@@ -351,7 +358,12 @@ static void gpu_reg_write(AdrenoState *s, uint32_t reg, uint32_t val)
     if (reg >= ADRENO_NREGS) {
         return;
     }
-    s->regs[reg] = val;
+    if (reg >= REG_SCRATCH_REG0 && reg < REG_SCRATCH_REG0 + 8) {
+        /* polled by the CPU without the lock (KGSL timestamps) */
+        qatomic_store_release(&s->regs[reg], val);
+    } else {
+        s->regs[reg] = val;
+    }
     if (reg >= REG_MH_MMU_CONFIG && reg <= REG_MH_MMU_INVALIDATE) {
         /* per-process page table switch from the ring (KGSL setstate) */
         adreno_tlb_flush(s);
@@ -706,7 +718,8 @@ static void cp_run(AdrenoState *s)
     uint32_t base = s->regs[REG_CP_RB_BASE];
     uint32_t size = 2u << (s->regs[REG_CP_RB_CNTL] & 0x3f);   /* dwords */
     uint32_t mask = size - 1;
-    uint32_t wptr = qatomic_read(&s->regs[REG_CP_RB_WPTR]) & mask;
+    /* pairs with the release in adreno_mmio_write: ring contents first */
+    uint32_t wptr = qatomic_load_acquire(&s->regs[REG_CP_RB_WPTR]) & mask;
     uint32_t rptr = s->regs[REG_CP_RB_RPTR] & mask;
 
     if (s->regs[REG_CP_ME_CNTL] & 0x10000000 || size > (1u << 22)) {
@@ -755,7 +768,7 @@ static void cp_run(AdrenoState *s)
         }
         cp_exec(s, buf, len, 0);
         /* consumed: publish the read pointer once the work is done */
-        qatomic_set(&s->regs[REG_CP_RB_RPTR], wptr);
+        qatomic_store_release(&s->regs[REG_CP_RB_RPTR], wptr);
         if (ringlog) {
             qemu_log("adreno: ring done ts %08x\n", s->regs[REG_SCRATCH_REG0]);
         }
@@ -785,7 +798,8 @@ static uint64_t adreno_mmio_read(void *opaque, hwaddr off, unsigned size)
     case REG_CP_RB_RPTR:
     case REG_CP_RB_WPTR:
     case REG_SCRATCH_REG0 ... REG_SCRATCH_REG0 + 7:
-        return qatomic_read(&s->regs[r]);   /* polled: never wait */
+        /* polled: never wait; acquire pairs with the GPU thread's release */
+        return qatomic_load_acquire(&s->regs[r]);
     }
     qemu_mutex_lock(&s->lock);
     v = adreno_mmio_read_locked(s, r);
@@ -823,8 +837,15 @@ static void adreno_mmio_write(void *opaque, hwaddr off, uint64_t val,
         return;
     }
     if (r == REG_CP_RB_WPTR) {
-        /* new commands: hand them to the GPU thread, do not wait */
-        qatomic_set(&s->regs[r], (uint32_t)val);
+        /*
+         * New commands: hand them to the GPU thread, do not wait.  The
+         * guest's ring and IB stores are plain host stores (single-threaded
+         * TCG drops guest barriers), so order them before the new write
+         * pointer here; without it an ARM64 host lets the GPU thread see
+         * the pointer before the commands and replay stale ones.
+         */
+        smp_mb();
+        qatomic_store_release(&s->regs[r], (uint32_t)val);
         qemu_event_set(&s->kick);
         return;
     }
