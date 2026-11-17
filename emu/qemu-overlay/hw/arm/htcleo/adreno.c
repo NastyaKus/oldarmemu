@@ -995,6 +995,10 @@ static int adreno_post_load(void *opaque, int version_id)
     adreno_tlb_flush(s);
     s->fault_reported = false;
     adreno_draw_post_load(s);
+    /* ADRENO_TRACE=+N: trace from the Nth draw after loading a snapshot */
+    if (getenv("ADRENO_TRACE") && getenv("ADRENO_TRACE")[0] == '+') {
+        adreno_trace_from = s->draws + atol(getenv("ADRENO_TRACE") + 1);
+    }
     qemu_set_irq(s->irq, adreno_irq_signal(s) != 0);
     return 0;
 }
