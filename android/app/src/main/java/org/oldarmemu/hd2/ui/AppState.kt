@@ -12,6 +12,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import org.oldarmemu.hd2.EmulatorActivity
 import org.oldarmemu.hd2.Settings
+import org.oldarmemu.hd2.Snapshots
 import org.oldarmemu.hd2.Storage
 import java.io.File
 import kotlin.concurrent.thread
@@ -20,6 +21,7 @@ import kotlin.concurrent.thread
 class AppState(val ctx: Context) {
     val st = Storage(ctx)
     val cfg = Settings(ctx)
+    val snaps = Snapshots(st)
     private val main = Handler(Looper.getMainLooper())
 
     /** bumped after anything changed on disk: screens re-read it */
@@ -63,6 +65,13 @@ class AppState(val ctx: Context) {
         }
         ctx.startActivity(Intent(ctx, EmulatorActivity::class.java)
             .putExtra("boot", boot).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+    }
+
+    /** Resume the phone from snapshot slot [i]. */
+    fun launchSnapshot(i: Int) {
+        ctx.startActivity(Intent(ctx, EmulatorActivity::class.java)
+            .putExtra("boot", "android").putExtra("snapshot", i)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
     /** The last frame the emulator showed, for the phone picture. */

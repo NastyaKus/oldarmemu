@@ -19,11 +19,13 @@ class Storage(private val ctx: Context) {
     val recovery = File(dir, "recovery.img")
     val sdcard = File(dir, "sdcard").apply { mkdirs() }
     val sdImage = File(dir, "sdcard.img")
-    private val sdStamp = File(dir, "sdcard.stamp")
+    val sdStamp = File(dir, "sdcard.stamp")
     val console = File(dir, "console.log")
     val hostlink = File(dir, "hostlink.shm")
     val qmpSocket = File(dir, "qmp.sock")
-    private val nandCfg = File(dir, "nand.cfg")
+    val qmpCtlSocket = File(dir, "qmp-ctl.sock")
+    val snapshotsDir = File(dir, "snapshots")
+    val nandCfg = File(dir, "nand.cfg")
     private val graphicsCfg = File(dir, "graphics.cfg")
     private val lastRom = File(dir, "last-rom.txt")
 

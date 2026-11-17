@@ -44,6 +44,13 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.foundation.Image
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material3.IconButton
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -113,6 +120,42 @@ fun HomeScreen(state: AppState, importRecovery: () -> Unit, addToSd: () -> Unit)
                 Icon(Icons.Filled.Build, null)
                 Spacer(Modifier.width(8.dp))
                 Text("Recovery", style = MaterialTheme.typography.titleMedium)
+            }
+        }
+
+        /* saved states: continue where the phone was left */
+        val saved = state.snaps.slots().filter { it.exists }
+        if (saved.isNotEmpty()) {
+            SectionHeader("Снимки состояния")
+            Card(
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(MaterialTheme.colorScheme.surfaceContainer),
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+            ) {
+                Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    for (slot in saved) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            val pic = remember(slot.time) { slot.preview() }
+                            Box(Modifier.size(36.dp, 60.dp).clip(RoundedCornerShape(6.dp))
+                                .background(androidx.compose.ui.graphics.Color.Black)) {
+                                pic?.let { Image(it.asImageBitmap(), null) }
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text("Слот ${slot.index}", style = MaterialTheme.typography.titleSmall)
+                                Text(SimpleDateFormat("d MMM, HH:mm", Locale("ru")).format(Date(slot.time)) +
+                                    " · " + formatSize(slot.bytes),
+                                    style = MaterialTheme.typography.bodySmall)
+                            }
+                            IconButton({ state.snaps.delete(slot.index); state.refresh() }) {
+                                Icon(Icons.Filled.Delete, "Удалить")
+                            }
+                            FilledTonalButton({ state.launchSnapshot(slot.index) }) {
+                                Text("Продолжить")
+                            }
+                        }
+                    }
+                }
             }
         }
 

@@ -37,12 +37,14 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
         return f.readText().trim().also { f.delete() }
     }
 
-    fun start(boot: Boot) {
+    /** Start the emulator; with [incoming] it resumes that saved state (paused). */
+    fun start(boot: Boot, incoming: File? = null) {
         val nl = st.nandLayout()
         val cfg = Settings(ctx)
         rebootFile.delete()
         st.hostlink.delete()
         st.qmpSocket.delete()
+        st.qmpCtlSocket.delete()
         val args = mutableListOf(
             binary.absolutePath,
             "-L", dataDir().absolutePath,
@@ -56,6 +58,7 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
             "-drive", "if=sd,format=raw,file=${st.sdImage.absolutePath}",
             "-display", "none",
             "-qmp", "unix:${st.qmpSocket.absolutePath},server=on,wait=off",
+            "-qmp", "unix:${st.qmpCtlSocket.absolutePath},server=on,wait=off",
             "-serial", "file:${st.console.absolutePath}",
             "-monitor", "none",
         )
@@ -65,8 +68,10 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
         // Wi-Fi: the emulated BCM4329 sees one access point, "HD2-Emulator",
         // NATed through the phone's own connection (QEMU user networking)
         if (cfg.wifi) args += listOf("-netdev", "user,id=wifi")
+        if (incoming != null) args += listOf("-incoming", "file:${incoming.absolutePath}")
         if (!st.nand.exists()) st.nand.createNewFile()   // grown on first use
-        st.prepareSdImage()
+        // a saved state comes with its own SD image: leave it untouched
+        if (incoming == null) st.prepareSdImage()
         val pb = ProcessBuilder(args)
             .directory(st.dir)
             .redirectErrorStream(true)

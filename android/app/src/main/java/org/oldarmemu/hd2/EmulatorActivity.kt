@@ -45,13 +45,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ListItem
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
@@ -63,7 +68,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.width
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
@@ -95,12 +103,18 @@ class EmulatorActivity : ComponentActivity() {
     private var status by mutableStateOf<String?>("Запуск эмулятора…")
     private var fps by mutableStateOf("")
     private var menu by mutableStateOf(false)
+    private var snapDialog by mutableStateOf(false)
+    private var snapBusy by mutableStateOf(false)
+    private var snapVersion by mutableStateOf(0)
+    private lateinit var snaps: Snapshots
+    private var bootMode = QemuProcess.Boot.ANDROID
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         st = Storage(this)
         cfg = Settings(this)
         qemu = QemuProcess(this, st)
+        snaps = Snapshots(st)
         if (cfg.keepScreenOn) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         WindowCompat.setDecorFitsSystemWindows(window, false)
         if (cfg.immersive) {
@@ -117,8 +131,10 @@ class EmulatorActivity : ComponentActivity() {
 
         if (cfg.sound) audio = AudioOut(cfg.audioLatencyMs) { link }.also { it.start() }
         ui.post(fpsTick)
-        boot(if (intent.getStringExtra("boot") == "recovery")
-            QemuProcess.Boot.RECOVERY else QemuProcess.Boot.ANDROID)
+        val mode = if (intent.getStringExtra("boot") == "recovery")
+            QemuProcess.Boot.RECOVERY else QemuProcess.Boot.ANDROID
+        val slot = intent.getIntExtra("snapshot", 0)
+        if (slot > 0 && snaps.slot(slot).exists) boot(mode, snaps.slot(slot)) else boot(mode)
     }
 
     /* ---------------- UI ---------------- */
@@ -183,6 +199,7 @@ class EmulatorActivity : ComponentActivity() {
             }
         }
         if (menu) MenuSheet()
+        if (snapDialog) SnapshotDialog()
     }
 
     /** One HD2 hardware button: pressed while the finger is down. */
@@ -224,6 +241,11 @@ class EmulatorActivity : ComponentActivity() {
                 MenuItem(Hd2Icons.Camera, "Скриншот", "Сохранить экран HD2 в Галерею") {
                     screenshot()
                 }
+                MenuItem(Hd2Icons.Download, "Снимки состояния",
+                    "Сохранить телефон как есть и продолжить потом") {
+                    snapVersion++
+                    snapDialog = true
+                }
                 MenuItem(Hd2Icons.Power, "Меню питания HD2", "Долгое нажатие кнопки питания") {
                     input?.key(QmpInput.POWER, true)
                     ui.postDelayed({ input?.key(QmpInput.POWER, false) }, 1800)
@@ -237,6 +259,86 @@ class EmulatorActivity : ComponentActivity() {
             }
         }
     }
+
+    /** Three save slots: picture, date, size; save / load / delete. */
+    @Composable
+    private fun SnapshotDialog() {
+        @Suppress("UNUSED_VARIABLE") val v = snapVersion
+        AlertDialog(
+            onDismissRequest = { if (!snapBusy) snapDialog = false },
+            title = { Text("Снимки состояния") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    for (slot in snaps.slots()) SnapshotRow(slot)
+                    Text("Снимок хранит память, экран и диски телефона. " +
+                        "Сохранение займёт несколько секунд.",
+                        style = MaterialTheme.typography.bodySmall)
+                }
+            },
+            confirmButton = {
+                TextButton({ snapDialog = false }, enabled = !snapBusy) { Text("Закрыть") }
+            },
+        )
+    }
+
+    @Composable
+    private fun SnapshotRow(slot: Snapshots.Slot) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            val pic = androidx.compose.runtime.remember(slot.time) { slot.preview() }
+            Box(Modifier.size(48.dp, 80.dp).background(androidx.compose.ui.graphics.Color.Black,
+                RoundedCornerShape(6.dp))) {
+                pic?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize()) }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Слот ${slot.index}", style = MaterialTheme.typography.titleSmall)
+                Text(if (slot.exists) SimpleDateFormat("d MMM, HH:mm", Locale("ru"))
+                        .format(Date(slot.time)) + " · " + formatSize(slot.bytes) else "Пусто",
+                    style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilledTonalButton({ saveSnapshot(slot.index) }, enabled = !snapBusy && link != null) {
+                        Text("Сохранить")
+                    }
+                    if (slot.exists) {
+                        OutlinedButton({ snapDialog = false; boot(bootMode, slot) }, enabled = !snapBusy) {
+                            Text("Загрузить")
+                        }
+                    }
+                }
+            }
+            if (slot.exists) {
+                IconButton({ snaps.delete(slot.index); snapVersion++ }, enabled = !snapBusy) {
+                    Icon(Icons.Filled.Delete, "Удалить")
+                }
+            }
+        }
+    }
+
+    private fun saveSnapshot(i: Int) {
+        snapBusy = true
+        snapDialog = false
+        val shot = screen.snapshot()
+        val mode = if (bootMode == QemuProcess.Boot.RECOVERY) "recovery" else "android"
+        status = "Сохранение снимка…"
+        Thread {
+            val err = runCatching {
+                QmpClient.connect(st.qmpCtlSocket, 3000).use { q ->
+                    snaps.save(i, q, mode, shot) { p ->
+                        ui.post { status = "Сохранение снимка… ${(p * 100).toInt()}%" }
+                    }
+                }
+            }.exceptionOrNull()
+            ui.post {
+                snapBusy = false
+                status = null
+                Toast.makeText(this, if (err == null) "Снимок сохранён в слот $i"
+                    else "Не удалось сохранить: ${err.message}", Toast.LENGTH_LONG).show()
+            }
+        }.start()
+    }
+
+    private fun formatSize(b: Long) = if (b >= 1L shl 30) "%.1f ГБ".format(b / (1L shl 30).toDouble())
+        else "${b shr 20} МБ"
 
     @Composable
     private fun MenuItem(icon: ImageVector, title: String, summary: String, action: () -> Unit) {
@@ -258,8 +360,9 @@ class EmulatorActivity : ComponentActivity() {
         }
     }
 
-    private fun boot(mode: QemuProcess.Boot) {
+    private fun boot(mode: QemuProcess.Boot, slot: Snapshots.Slot? = null) {
         poweredOff = false
+        bootMode = if (slot != null && slot.boot == "recovery") QemuProcess.Boot.RECOVERY else mode
         val gen = ++generation
         input?.stop()
         input = null
@@ -269,8 +372,15 @@ class EmulatorActivity : ComponentActivity() {
         Thread {
             try {
                 qemu.stop()
-                qemu.start(mode)
+                if (slot != null) {
+                    ui.post { if (gen == generation) status = "Восстановление снимка…" }
+                    snaps.restoreDisks(slot) { p ->
+                        ui.post { if (gen == generation) status = "Восстановление снимка… ${(p * 100).toInt()}%" }
+                    }
+                }
+                qemu.start(bootMode, slot?.state)
                 ui.post { if (gen == generation) status = "Запуск эмулятора…" }
+                if (slot != null) resumeIncoming(gen)
                 input = QmpInput(st.qmpSocket).also { it.start() }
                 // map the shared screen/sound file as soon as QEMU made it
                 val until = System.currentTimeMillis() + 20000
@@ -284,6 +394,22 @@ class EmulatorActivity : ComponentActivity() {
                 ui.post { status = "Не удалось запустить QEMU: ${e.message}" }
             }
         }.start()
+    }
+
+    /* a saved state loads paused: resume it once QEMU has read it */
+    private fun resumeIncoming(gen: Int) {
+        runCatching {
+            QmpClient.connect(st.qmpCtlSocket).use { q ->
+                val until = System.currentTimeMillis() + 120000
+                while (gen == generation && System.currentTimeMillis() < until) {
+                    when (q.status()) {
+                        "paused", "postmigrate" -> { q.cmd("cont"); return }
+                        "running" -> return
+                    }
+                    Thread.sleep(50)
+                }
+            }
+        }
     }
 
     private fun showExit() {
