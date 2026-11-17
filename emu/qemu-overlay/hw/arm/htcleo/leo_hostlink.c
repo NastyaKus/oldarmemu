@@ -195,6 +195,54 @@ static int leo_cpu_speeds(long *speed, int max_cpus, const char **how)
     return n;
 }
 
+#ifdef __linux__
+static cpu_set_t leo_fast_set;
+static bool leo_fast_valid;
+
+/* the cgroup cpuset Android keeps this process in, and what it allows */
+static void leo_log_cpuset(const char *when)
+{
+    char *cg = NULL, *st = NULL, *allowed = NULL;
+
+    g_file_get_contents("/proc/self/cpuset", &cg, NULL, NULL);
+    if (g_file_get_contents("/proc/self/status", &st, NULL, NULL)) {
+        char *p = strstr(st, "Cpus_allowed_list:");
+        if (p) {
+            allowed = g_strndup(p + 18, strcspn(p + 18, "\n"));
+            g_strstrip(allowed);
+        }
+    }
+    info_report("htc-leo: %s: cpuset %s, allowed CPUs %s", when,
+                cg ? g_strstrip(cg) : "?", allowed ? allowed : "?");
+    g_free(cg);
+    g_free(st);
+    g_free(allowed);
+}
+
+/*
+ * Android moves an app's child processes between cpusets (top-app,
+ * foreground, background...), and moving a task resets its affinity to
+ * the new cpuset: put every thread back on the fast cores.
+ */
+static int leo_repin_threads(void)
+{
+    GDir *d = g_dir_open("/proc/self/task", 0, NULL);
+    const char *e;
+    int ok = 0;
+
+    if (!d) {
+        return 0;
+    }
+    while ((e = g_dir_read_name(d))) {
+        if (sched_setaffinity(atoi(e), sizeof(leo_fast_set), &leo_fast_set) == 0) {
+            ok++;
+        }
+    }
+    g_dir_close(d);
+    return ok;
+}
+#endif
+
 void leo_pin_fast_cpus(void)
 {
 #ifdef __linux__
@@ -223,6 +271,9 @@ void leo_pin_fast_cpus(void)
             g_string_append_printf(list, " %d", i);
         }
     }
+    leo_fast_set = set;
+    leo_fast_valid = true;
+    leo_log_cpuset("start");
     if (sched_setaffinity(0, sizeof(set), &set) < 0) {
         warn_report("htc-leo: cannot pin to fast CPUs: %s", strerror(errno));
     } else {
@@ -251,7 +302,8 @@ void leo_cpu_report(void)
     int tids[64];
     unsigned long ticks[64];
 
-    if (now - last < 10000) {
+    static int64_t last_log;
+    if (now - last < 2000) {
         return;
     }
     d = g_dir_open("/proc/self/task", 0, NULL);
@@ -290,7 +342,17 @@ void leo_cpu_report(void)
         g_free(txt);
     }
     g_dir_close(d);
-    if (last && best_cpu >= 0) {
+    bool off = leo_fast_valid && best_cpu >= 0 && !CPU_ISSET(best_cpu, &leo_fast_set);
+    static int repins;
+    if (off) {
+        int n = leo_repin_threads();
+        if (repins++ < 3) {
+            leo_log_cpuset("emulator found on a slow core");
+            info_report("htc-leo: re-pinned %d threads to the fast cores", n);
+        }
+    }
+    if (last && best_cpu >= 0 && now - last_log >= 10000) {
+        last_log = now;
         char path[96], *f = NULL;
         snprintf(path, sizeof(path),
                  "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", best_cpu);
