@@ -22,6 +22,8 @@
 #include "qemu/error-report.h"
 #include "qapi/error.h"
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include "qemu/timer.h"
 #include "msm.h"
 
 #define HL_MAGIC        0x4c324448      /* "HD2L" */
@@ -134,35 +136,176 @@ void leo_hostlink_audio_write(const uint8_t *pcm, uint32_t len)
  * top frequency): TCG is single threaded per guest CPU and suffers badly
  * when the scheduler parks it on a little core.
  */
+/* little cores by MIDR part number (ARM: A53, A55, A35, A510, A520) */
+static bool leo_little_part(unsigned part)
+{
+    return part == 0xd03 || part == 0xd05 || part == 0xd04 ||
+           part == 0xd46 || part == 0xd80;
+}
+
+/*
+ * A relative speed for each CPU: cpufreq maximum, else the scheduler's
+ * capacity, else "little or not" from /proc/cpuinfo.  Android often denies
+ * apps the first two, which used to leave the emulator unpinned and, as
+ * seen on a Snapdragon 8 Gen 2, running at a third of its speed.
+ */
+static int leo_cpu_speeds(long *speed, int max_cpus, const char **how)
+{
+    int n = 0;
+
+    for (int pass = 0; pass < 2 && !n; pass++) {
+        for (n = 0; n < max_cpus; n++) {
+            char path[96], *txt = NULL;
+            snprintf(path, sizeof(path), pass == 0 ?
+                     "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq" :
+                     "/sys/devices/system/cpu/cpu%d/cpu_capacity", n);
+            if (!g_file_get_contents(path, &txt, NULL, NULL)) {
+                break;
+            }
+            speed[n] = strtol(txt, NULL, 10);
+            g_free(txt);
+        }
+        *how = pass == 0 ? "cpufreq" : "cpu_capacity";
+    }
+    if (n >= 2) {
+        return n;
+    }
+
+    char *info = NULL;
+    n = 0;
+    if (g_file_get_contents("/proc/cpuinfo", &info, NULL, NULL)) {
+        int cur = -1;
+        for (char *l = strtok(info, "\n"); l; l = strtok(NULL, "\n")) {
+            unsigned v;
+            if (sscanf(l, "processor : %u", &v) == 1 ||
+                sscanf(l, "processor\t: %u", &v) == 1) {
+                cur = v;
+                if (cur < max_cpus) {
+                    speed[cur] = 2;
+                    n = MAX(n, cur + 1);
+                }
+            } else if (cur >= 0 && cur < max_cpus &&
+                       sscanf(l, "CPU part\t: %x", &v) == 1) {
+                speed[cur] = leo_little_part(v) ? 1 : 2;
+            }
+        }
+        g_free(info);
+    }
+    *how = "cpuinfo";
+    return n;
+}
+
 void leo_pin_fast_cpus(void)
 {
 #ifdef __linux__
-    long max = 0, freq[256];
-    int n = 0;
+    long max = 0, speed[256];
+    const char *how = "";
+    int n = leo_cpu_speeds(speed, 256, &how);
     cpu_set_t set;
+    GString *list = g_string_new("");
 
-    for (; n < 256; n++) {
-        char path[96], *txt = NULL;
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", n);
-        if (!g_file_get_contents(path, &txt, NULL, NULL)) {
-            break;
-        }
-        freq[n] = strtol(txt, NULL, 10);
-        g_free(txt);
-        max = MAX(max, freq[n]);
+    /* raise the emulator's priority where allowed (threads inherit it) */
+    if (setpriority(PRIO_PROCESS, 0, -10) < 0) {
+        setpriority(PRIO_PROCESS, 0, -4);
+    }
+    for (int i = 0; i < n; i++) {
+        max = MAX(max, speed[i]);
     }
     if (n < 2 || !max) {
+        info_report("htc-leo: CPU pinning: no CPU information (%s)", how);
+        g_string_free(list, true);
         return;
     }
     CPU_ZERO(&set);
     for (int i = 0; i < n; i++) {
-        if (freq[i] * 4 >= max * 3) {
+        if (speed[i] * 4 >= max * 3) {
             CPU_SET(i, &set);
+            g_string_append_printf(list, " %d", i);
         }
     }
     if (sched_setaffinity(0, sizeof(set), &set) < 0) {
         warn_report("htc-leo: cannot pin to fast CPUs: %s", strerror(errno));
+    } else {
+        info_report("htc-leo: pinned to fast CPUs%s (by %s), nice %d", list->str,
+                    how, getpriority(PRIO_PROCESS, 0));
     }
+    g_string_free(list, true);
+#endif
+}
+
+/*
+ * Every 10 s, log where the busiest emulator thread ran and how much CPU
+ * it got: tells from a user's qemu.log whether it sat on a slow core.
+ */
+void leo_cpu_report(void)
+{
+#ifdef __linux__
+    static int64_t last;
+    static unsigned long prev_ticks[64];
+    static int prev_tid[64];
+    int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    GDir *d;
+    const char *e;
+    int best_tid = 0, best_cpu = -1, k = 0;
+    unsigned long best = 0;
+    int tids[64];
+    unsigned long ticks[64];
+
+    if (now - last < 10000) {
+        return;
+    }
+    d = g_dir_open("/proc/self/task", 0, NULL);
+    if (!d) {
+        return;
+    }
+    while ((e = g_dir_read_name(d)) && k < 64) {
+        char path[64], *txt = NULL, *p;
+        snprintf(path, sizeof(path), "/proc/self/task/%s/stat", e);
+        if (!g_file_get_contents(path, &txt, NULL, NULL)) {
+            continue;
+        }
+        p = strrchr(txt, ')');
+        unsigned long ut = 0, st = 0;
+        int cpu = -1;
+        if (p && sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u "
+                        "%lu %lu %*d %*d %*d %*d %*d %*d %*u %*u %*d %*u %*u "
+                        "%*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u "
+                        "%*d %d", &ut, &st, &cpu) == 3) {
+            int tid = atoi(e);
+            unsigned long delta = ut + st;
+            for (int i = 0; i < 64; i++) {
+                if (prev_tid[i] == tid) {
+                    delta -= prev_ticks[i];
+                }
+            }
+            tids[k] = tid;
+            ticks[k] = ut + st;
+            k++;
+            if (delta > best) {
+                best = delta;
+                best_tid = tid;
+                best_cpu = cpu;
+            }
+        }
+        g_free(txt);
+    }
+    g_dir_close(d);
+    if (last && best_cpu >= 0) {
+        char path[96], *f = NULL;
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", best_cpu);
+        g_file_get_contents(path, &f, NULL, NULL);
+        info_report("htc-leo: busiest thread %d on CPU %d, %lu%% of a core%s%s",
+                    best_tid, best_cpu,
+                    best * 100 / (sysconf(_SC_CLK_TCK) * (now - last) / 1000 + 1),
+                    f ? ", MHz " : "", f ? g_strstrip(f) : "");
+        g_free(f);
+    }
+    memset(prev_tid, 0, sizeof(prev_tid));
+    for (int i = 0; i < k; i++) {
+        prev_tid[i] = tids[i];
+        prev_ticks[i] = ticks[i];
+    }
+    last = now;
 #endif
 }

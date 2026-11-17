@@ -139,6 +139,7 @@ void leo_hostlink_fb_done(int w, int h, bool lcd_on);
 void leo_hostlink_audio_format(uint32_t rate, uint32_t channels);
 void leo_hostlink_audio_write(const uint8_t *pcm, uint32_t len);
 void leo_pin_fast_cpus(void);
+void leo_cpu_report(void);
 
 /* Press/release an HD2 hardware button (index, see htc_leo.c). */
 void leo_set_key(int key, bool down);

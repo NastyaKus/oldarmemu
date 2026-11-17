@@ -180,6 +180,7 @@ static void leo_rc_emit(HtcLeoMachineState *s, const uint8_t *buf, int len)
 
 static void leo_rc_poll(void *opaque)
 {
+    leo_cpu_report();
     HtcLeoMachineState *s = opaque;
     uint32_t hdr[3];
     const uint32_t data_size = LEO_RAM_CONSOLE_SIZE - 12;
