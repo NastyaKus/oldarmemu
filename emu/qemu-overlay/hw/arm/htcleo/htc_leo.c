@@ -517,6 +517,7 @@ static void htc_leo_init(MachineState *machine)
     if (s->pin_cpu) {
         leo_pin_fast_cpus();        /* before the vCPU thread exists */
     }
+    leo_host_bench();
     if (s->hostlink) {
         leo_hostlink_open(s->hostlink, &error_fatal);
     }

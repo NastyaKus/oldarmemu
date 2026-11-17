@@ -285,6 +285,31 @@ void leo_pin_fast_cpus(void)
 }
 
 /*
+ * A plain CPU speed figure for the log: dependent 64-bit multiply-adds,
+ * about one per 3-4 cycles on any recent core, so it reflects the clock
+ * and core type the emulator got (compare with the guest's BogoMIPS).
+ */
+void leo_host_bench(void)
+{
+    uint64_t x = 1;
+    const long n = 40 * 1000 * 1000;
+    int64_t t0 = get_clock(), t1;
+
+    for (long i = 0; i < n; i++) {
+        x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+        asm volatile("" : "+r"(x));
+    }
+    t1 = get_clock();
+#ifdef __linux__
+    int cpu = sched_getcpu();
+#else
+    int cpu = -1;
+#endif
+    info_report("htc-leo: host speed %.0f M steps/s on CPU %d (%" PRIx64 ")",
+                n * 1000.0 / MAX(t1 - t0, 1), cpu, x & 0xff);
+}
+
+/*
  * Every 10 s, log where the busiest emulator thread ran and how much CPU
  * it got: tells from a user's qemu.log whether it sat on a slow core.
  */
@@ -319,10 +344,12 @@ void leo_cpu_report(void)
         p = strrchr(txt, ')');
         unsigned long ut = 0, st = 0;
         int cpu = -1;
-        if (p && sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u "
-                        "%lu %lu %*d %*d %*d %*d %*d %*d %*u %*u %*d %*u %*u "
-                        "%*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u %*u "
-                        "%*d %d", &ut, &st, &cpu) == 3) {
+        /* fields after "(comm) ": state is #3, utime #14, stime #15, processor #39 */
+        g_auto(GStrv) f = p ? g_strsplit(p + 2, " ", 0) : NULL;
+        if (f && g_strv_length(f) > 36) {
+            ut = strtoul(f[11], NULL, 10);
+            st = strtoul(f[12], NULL, 10);
+            cpu = atoi(f[36]);
             int tid = atoi(e);
             unsigned long delta = ut + st;
             for (int i = 0; i < 64; i++) {
