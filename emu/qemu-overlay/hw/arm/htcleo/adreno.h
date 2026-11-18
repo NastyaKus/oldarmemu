@@ -19,6 +19,16 @@ OBJECT_DECLARE_SIMPLE_TYPE(AdrenoState, ADRENO)
 #define ADRENO_FETCH_CONSTS     (32 * 6)        /* 32 x 6-dword fetch consts */
 #define ADRENO_GMEM_SIZE        (256 * 1024)
 
+/* MMU translation and host page pointers cached by one thread */
+#define ADRENO_HP_ENTRIES 256
+typedef struct AdrenoMemCache {
+    uint32_t gen;
+    bool tlb_valid;
+    uint32_t tlb_idx, tlb_pte;
+    uint32_t hp_tag[ADRENO_HP_ENTRIES];     /* page + 1, 0 = empty */
+    uint8_t *hp_ptr[ADRENO_HP_ENTRIES];
+} AdrenoMemCache;
+
 struct AdrenoState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
@@ -26,15 +36,14 @@ struct AdrenoState {
 
     uint32_t regs[ADRENO_NREGS];
 
-    /* MMU: one cached translation */
-    bool tlb_valid;
     bool fault_reported;
-    uint32_t tlb_idx, tlb_pte;
-
-    /* host pointers of recently used GPU pages (read side) */
-#define ADRENO_HP_ENTRIES 256
-    uint32_t hp_tag[ADRENO_HP_ENTRIES];     /* page + 1, 0 = empty */
-    uint8_t *hp_ptr[ADRENO_HP_ENTRIES];
+    /*
+     * Cached GPU translations: the GPU thread's below, the draw workers'
+     * in adreno_draw.c.  Bumping mc_gen (MMU or page table change)
+     * invalidates all of them.
+     */
+    uint32_t mc_gen;
+    AdrenoMemCache mc;
 
     /*
      * Shader instruction store; constants live in the register file
@@ -67,6 +76,15 @@ struct AdrenoState {
     QEMUBH *irq_bh;
     bool quit;
     bool paused;                /* the VM is stopped: the GPU stops too */
+    /*
+     * The GPU thread holds the lock while it runs the ring, but lets
+     * waiting CPU accesses (IRQ status/ack...) in between packets: in_run
+     * marks a ring pass in progress, mmio_waiting counts CPU accesses
+     * waiting for the lock, run_done is signalled at the end of a pass.
+     */
+    bool in_run;
+    int mmio_waiting;
+    QemuCond run_done;
 };
 
 #define ADRENO_REG_ALU          0x4000
@@ -89,24 +107,53 @@ extern int adreno_trace;
 extern long adreno_trace_from;
 extern long adreno_trace_len;
 
-bool adreno_xlate(AdrenoState *s, uint32_t va, hwaddr *pa);
+/*
+ * GPU memory access.  The _c variants take the calling thread's cache
+ * (draw workers); the plain ones use the GPU thread's.
+ */
+bool adreno_xlate_c(AdrenoState *s, AdrenoMemCache *c, uint32_t va, hwaddr *pa);
+void adreno_read_c(AdrenoState *s, AdrenoMemCache *c, uint32_t va, void *buf,
+                   uint32_t len);
+void adreno_write_c(AdrenoState *s, AdrenoMemCache *c, uint32_t va,
+                    const void *buf, uint32_t len);
+uint8_t *adreno_host_page_slow(AdrenoState *s, AdrenoMemCache *c, uint32_t va);
 uint32_t adreno_rd32(AdrenoState *s, uint32_t va);
 void adreno_wr32(AdrenoState *s, uint32_t va, uint32_t val);
-void adreno_read(AdrenoState *s, uint32_t va, void *buf, uint32_t len);
-uint8_t *adreno_host_page_slow(AdrenoState *s, uint32_t va);
 void adreno_mark_dirty(AdrenoState *s, uint32_t va, uint32_t len);
+void adreno_watch_draw(AdrenoState *s, uint32_t va, uint32_t len, const char *what);
+
+static inline bool adreno_xlate(AdrenoState *s, uint32_t va, hwaddr *pa)
+{
+    return adreno_xlate_c(s, &s->mc, va, pa);
+}
+
+static inline void adreno_read(AdrenoState *s, uint32_t va, void *buf, uint32_t len)
+{
+    adreno_read_c(s, &s->mc, va, buf, len);
+}
+
+static inline void adreno_write(AdrenoState *s, uint32_t va, const void *buf,
+                                uint32_t len)
+{
+    adreno_write_c(s, &s->mc, va, buf, len);
+}
 
 /* host pointer to the RAM page holding GPU address va, NULL if not RAM */
-static inline uint8_t *adreno_host_page(AdrenoState *s, uint32_t va)
+static inline uint8_t *adreno_host_page_c(AdrenoState *s, AdrenoMemCache *c,
+                                          uint32_t va)
 {
     uint32_t pg = va >> 12, i = pg & (ADRENO_HP_ENTRIES - 1);
 
-    if (s->hp_tag[i] == pg + 1) {
-        return s->hp_ptr[i];
+    if (c->hp_tag[i] == pg + 1 && c->gen == s->mc_gen) {
+        return c->hp_ptr[i];
     }
-    return adreno_host_page_slow(s, va);
+    return adreno_host_page_slow(s, c, va);
 }
-void adreno_write(AdrenoState *s, uint32_t va, const void *buf, uint32_t len);
+
+static inline uint8_t *adreno_host_page(AdrenoState *s, uint32_t va)
+{
+    return adreno_host_page_c(s, &s->mc, va);
+}
 
 /* adreno_draw.c */
 void adreno_draw_reset(AdrenoState *s);

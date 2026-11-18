@@ -13,6 +13,10 @@
 #include "qemu/log.h"
 #include <math.h>
 #include "qemu/timer.h"
+#include "qemu/atomic.h"
+#include "qemu/rcu.h"
+#include "qemu/error-report.h"
+#include <sched.h>
 #include "adreno.h"
 #include "adreno_regs.h"
 
@@ -24,7 +28,10 @@ void adreno_etc1_texel(const uint8_t *blk, int px, int py, float *rgba);
 
 enum { ST_VS = 0, ST_PS = 1 };
 
+typedef struct RCtx RCtx;
+
 typedef struct Thread {
+    RCtx *rc;               /* memory and texture caches of this host thread */
     int stage;
     V4 r[64];
     V4 exp[64];
@@ -473,6 +480,17 @@ static bool decode_format(uint32_t fmt, const uint32_t *dw, bool sign,
             v[2] = ((x >> 11) & 31) * (1.0f / 31);
             v[3] = 1.0f;
             return true;
+        case 2: case 8: case 9:         /* 8 (alpha masks of text) */
+            v[0] = unorm8[x & 0xff];
+            v[1] = v[2] = 0.0f;
+            v[3] = 1.0f;
+            return true;
+        case 15:                        /* 4_4_4_4 */
+            v[0] = (x & 15) * (1.0f / 15);
+            v[1] = ((x >> 4) & 15) * (1.0f / 15);
+            v[2] = ((x >> 8) & 15) * (1.0f / 15);
+            v[3] = ((x >> 12) & 15) * (1.0f / 15);
+            return true;
         }
     }
     v[0] = v[1] = v[2] = 0.0f;
@@ -667,7 +685,8 @@ static int wrap_coord(int i, int n, uint32_t mode)
     }
 }
 
-static void texel(AdrenoState *s, const TexInfo *ti, int x, int y, float *v)
+static void texel(AdrenoState *s, AdrenoMemCache *mc, const TexInfo *ti, int x,
+                  int y, float *v)
 {
     uint32_t dw[4] = { 0, 0, 0, 0 };
 
@@ -678,18 +697,18 @@ static void texel(AdrenoState *s, const TexInfo *ti, int x, int y, float *v)
         uint32_t bw = (ti->pitch + 3) / 4;
         uint32_t blk = ((y / 4) * bw + x / 4) * 8;
         uint8_t b[8];
-        adreno_read(s, ti->base + blk, b, 8);
+        adreno_read_c(s, mc, ti->base + blk, b, 8);
         adreno_etc1_texel(b, x & 3, y & 3, v);
         return;
     }
     uint32_t off = ti->tiled ? tiled_offset(x, y, ti->pitch, ti->bpp)
                              : (y * ti->pitch + x) * ti->bpp;
     uint32_t va = ti->base + off, nb = ti->bpp <= 16 ? ti->bpp : 16;
-    uint8_t *hp = adreno_host_page(s, va);
+    uint8_t *hp = adreno_host_page_c(s, mc, va);
     if (hp && (va & 4095) + nb <= 4096) {
         memcpy(dw, hp + (va & 4095), nb);
     } else {
-        adreno_read(s, va, dw, nb);
+        adreno_read_c(s, mc, va, dw, nb);
     }
     for (int i = 0; i < 4; i++) {
         dw[i] = le32_to_cpu(dw[i]);
@@ -698,8 +717,8 @@ static void texel(AdrenoState *s, const TexInfo *ti, int x, int y, float *v)
 }
 
 /* row cache: avoid one guest-memory translation per texel */
-static void tex_sample(AdrenoState *s, const TexInfo *ti, float u, float v,
-                       bool denorm, int filter, float *out)
+static void tex_sample(AdrenoState *s, AdrenoMemCache *mc, const TexInfo *ti,
+                       float u, float v, bool denorm, int filter, float *out)
 {
     float raw[4];
 
@@ -715,20 +734,20 @@ static void tex_sample(AdrenoState *s, const TexInfo *ti, float u, float v,
         /* 1:1 composition samples texel centres: one fetch is enough */
         const float eps = 1.0f / 512;
         if ((ax < eps || ax > 1 - eps) && (ay < eps || ay > 1 - eps)) {
-            texel(s, ti, x0 + (ax > 0.5f), y0 + (ay > 0.5f), raw);
+            texel(s, mc, ti, x0 + (ax > 0.5f), y0 + (ay > 0.5f), raw);
             goto filtered;
         }
-        texel(s, ti, x0, y0, t00);
-        texel(s, ti, x0 + 1, y0, t10);
-        texel(s, ti, x0, y0 + 1, t01);
-        texel(s, ti, x0 + 1, y0 + 1, t11);
+        texel(s, mc, ti, x0, y0, t00);
+        texel(s, mc, ti, x0 + 1, y0, t10);
+        texel(s, mc, ti, x0, y0 + 1, t01);
+        texel(s, mc, ti, x0 + 1, y0 + 1, t11);
         for (int i = 0; i < 4; i++) {
             float top = t00[i] + (t10[i] - t00[i]) * ax;
             float bot = t01[i] + (t11[i] - t01[i]) * ax;
             raw[i] = top + (bot - top) * ay;
         }
     } else {
-        texel(s, ti, (int)floorf(u), (int)floorf(v), raw);
+        texel(s, mc, ti, (int)floorf(u), (int)floorf(v), raw);
     }
 filtered:
     if (ti->exp_adj) {
@@ -745,9 +764,34 @@ filtered:
 
 static uint64_t stat_fast;              /* draws on the fast path */
 
-/* texture constants decoded once per draw */
-static TexInfo tic[32];
-static uint32_t tic_valid;
+/*
+ * Per host thread state of the rasterizer: draws are split by rows over
+ * the GPU thread and worker threads, each with its own caches.
+ */
+#define RP_MAX 8
+#define RP_ROWS_SHIFT 2              /* bands of 4 rows */
+struct RCtx {
+    AdrenoMemCache mc;
+    TexInfo tic[32];                    /* texture constants decoded once per draw */
+    uint32_t tic_valid;
+};
+static RCtx rctx[RP_MAX];
+
+static const TexInfo *rc_tex(AdrenoState *s, RCtx *rc, uint32_t idx)
+{
+    if (!(rc->tic_valid & (1u << idx))) {
+        tex_info(s, idx, &rc->tic[idx]);
+        rc->tic_valid |= 1u << idx;
+    }
+    return &rc->tic[idx];
+}
+
+static void rc_invalidate_tex(void)
+{
+    for (int i = 0; i < RP_MAX; i++) {
+        rctx[i].tic_valid = 0;
+    }
+}
 
 static void tex_fetch(AdrenoState *s, Thread *t, const uint32_t *w)
 {
@@ -768,11 +812,7 @@ static void tex_fetch(AdrenoState *s, Thread *t, const uint32_t *w)
         store_fetch(t, dst, dst_rel, dswz, v);
         return;
     }
-    if (!(tic_valid & (1u << cidx))) {
-        tex_info(s, cidx, &tic[cidx]);
-        tic_valid |= 1u << cidx;
-    }
-    ti = tic[cidx];
+    ti = *rc_tex(s, t->rc, cidx);
     V4 *c = tmp(t, src, src_rel);
     float u = c->f[sswz & 3], vv = c->f[(sswz >> 2) & 3];
     int filter = mag == 3 ? ti.mag : mag;
@@ -783,7 +823,7 @@ static void tex_fetch(AdrenoState *s, Thread *t, const uint32_t *w)
             qemu_log_mask(LOG_UNIMP, "adreno: texture format %u\n", ti.fmt);
         }
     } else {
-        tex_sample(s, &ti, u, vv, denorm, filter, v);
+        tex_sample(s, &t->rc->mc, &ti, u, vv, denorm, filter, v);
     }
     store_fetch(t, dst, dst_rel, dswz, v);
 }
@@ -935,10 +975,15 @@ typedef struct PVtx {
 #define SYM_NONE    (-1)
 #define SYM_BAD     (-2)
 
-typedef struct Sym { float a, b, c; int k, m; } Sym;
+/*
+ * b + sum(a[i] * T[i]) + c * P[m]; k is the mask of texel components
+ * used (0 = none) or SYM_BAD.
+ */
+typedef struct Sym { float a[4], b, c; int k, m; } Sym;
 
 typedef struct FastPS {
     bool ok, has_tex, denorm, uses_params;
+    int npm, pm[4];                     /* input components the outputs use */
     uint32_t tcidx, param, uc, vc;
     int mag;
     Sym out[4];
@@ -946,6 +991,9 @@ typedef struct FastPS {
 
 typedef struct DrawState {
     AdrenoState *s;
+    RCtx *rc;               /* caches of the thread running this part */
+    int part, nparts;       /* rows ((y >> RP_ROWS_SHIFT) % nparts) == part */
+    bool nocull;            /* RECTLIST: both halves whatever the winding */
     uint32_t mode;          /* EDRAM mode */
     int sx0, sy0, sx1, sy1; /* scissor (inclusive-exclusive) in GMEM pixels */
     uint32_t nparams;
@@ -957,6 +1005,7 @@ typedef struct DrawState {
     bool sysmem, clinear;               /* rendering straight to memory */
     uint32_t dirty_lo, dirty_hi;        /* memory written, for dirty bits */
     uint32_t samples;                   /* MSAA samples per pixel */
+    uint32_t reg_pitch, bin_w, bin_h;   /* for the GMEM row stride */
     uint32_t zbase, zfmt;
     uint32_t zctl, cctl, blend, cmask;
     float alpha_ref;
@@ -1163,13 +1212,13 @@ static inline uint8_t *gmem_at(AdrenoState *s, uint32_t off)
 
 static inline Sym sym_c(float b)
 {
-    Sym r = { 0.0f, b, 0.0f, SYM_NONE, SYM_NONE };
+    Sym r = { { 0, 0, 0, 0 }, b, 0.0f, 0, SYM_NONE };
     return r;
 }
 
 static inline Sym sym_bad(void)
 {
-    Sym r = { 0.0f, 0.0f, 0.0f, SYM_BAD, SYM_NONE };
+    Sym r = { { 0, 0, 0, 0 }, 0.0f, 0.0f, SYM_BAD, SYM_NONE };
     return r;
 }
 
@@ -1180,18 +1229,17 @@ static inline bool sym_ok(Sym x)
 
 static inline bool sym_const(Sym x)
 {
-    return x.k == SYM_NONE && x.m == SYM_NONE;
+    return x.k == 0 && x.m == SYM_NONE;
 }
 
 static Sym sym_add(Sym x, Sym y)
 {
     if (!sym_ok(x) || !sym_ok(y) ||
-        (x.k != SYM_NONE && y.k != SYM_NONE && x.k != y.k) ||
         (x.m != SYM_NONE && y.m != SYM_NONE && x.m != y.m)) {
         return sym_bad();
     }
-    Sym r = { x.a + y.a, x.b + y.b, x.c + y.c,
-              x.k != SYM_NONE ? x.k : y.k, x.m != SYM_NONE ? x.m : y.m };
+    Sym r = { { x.a[0] + y.a[0], x.a[1] + y.a[1], x.a[2] + y.a[2], x.a[3] + y.a[3] },
+              x.b + y.b, x.c + y.c, x.k | y.k, x.m != SYM_NONE ? x.m : y.m };
     return r;
 }
 
@@ -1200,7 +1248,9 @@ static Sym sym_scale(Sym x, float f)
     if (f == 0.0f) {
         return sym_c(0.0f);
     }
-    x.a *= f;
+    for (int i = 0; i < 4; i++) {
+        x.a[i] *= f;
+    }
     x.b *= f;
     x.c *= f;
     return x;
@@ -1225,7 +1275,8 @@ static Sym sym_mul(Sym x, Sym y)
 
 static inline bool sym_same(Sym x, Sym y)
 {
-    return x.k == y.k && x.m == y.m && x.a == y.a && x.b == y.b && x.c == y.c;
+    return x.k == y.k && x.m == y.m && x.b == y.b && x.c == y.c &&
+           !memcmp(x.a, y.a, sizeof(x.a));
 }
 
 static Sym sym_minmax(Sym x, Sym y, bool max)
@@ -1242,17 +1293,33 @@ static Sym sym_minmax(Sym x, Sym y, bool max)
     return sym_bad();
 }
 
+/*
+ * Range of every interpolated input over the draw (from its vertices,
+ * which bound the pixels' values), set while analysing a pixel shader.
+ */
+static const float *sym_plo, *sym_phi;
+
 /* x within [lo, hi] for every texel in [0, 1] (unsigned formats) */
 static bool sym_in_range(Sym x, bool unsigned_tex, float lo, float hi)
 {
+    float e0 = x.b, e1 = x.b;
+
     if (x.m != SYM_NONE) {
-        return false;
+        if (!sym_plo || !(sym_plo[x.m] <= sym_phi[x.m])) {
+            return false;
+        }
+        float p0 = x.c * sym_plo[x.m], p1 = x.c * sym_phi[x.m];
+        e0 += MIN(p0, p1);
+        e1 += MAX(p0, p1);
     }
-    if (x.k == SYM_NONE) {
-        return x.b >= lo && x.b <= hi;
+    if (!x.k) {
+        return e0 >= lo && e1 <= hi;
     }
-    float e0 = x.b, e1 = x.b + x.a;
-    return unsigned_tex && MIN(e0, e1) >= lo && MAX(e0, e1) <= hi;
+    for (int i = 0; i < 4; i++) {
+        e0 += MIN(x.a[i], 0.0f);
+        e1 += MAX(x.a[i], 0.0f);
+    }
+    return unsigned_tex && e0 >= lo && e1 <= hi;
 }
 
 static Sym sym_sat(Sym x, bool unsigned_tex)
@@ -1263,6 +1330,10 @@ static Sym sym_sat(Sym x, bool unsigned_tex)
     return sym_ok(x) && sym_in_range(x, unsigned_tex, 0.0f, 1.0f) ? x
                                                                    : sym_bad();
 }
+
+/* source line where the last ps_analyze gave up (ADRENO_STATS) */
+static int ps_fail;
+#define PS_FAIL() do { ps_fail = __LINE__; return; } while (0)
 
 static void ps_analyze(AdrenoState *s, DrawState *ds)
 {
@@ -1275,11 +1346,12 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
     bool unsigned_tex = true;
 
     memset(f, 0, sizeof(*f));
+    ps_fail = 0;
     ct.stage = ST_PS;
     for (int i = 0; i < 64; i++) {
         for (int c = 0; c < 4; c++) {
             if ((uint32_t)i < ds->nparams) {
-                Sym p = { 0.0f, 0.0f, 1.0f, SYM_NONE, i * 4 + c };
+                Sym p = { { 0, 0, 0, 0 }, 0.0f, 1.0f, 0, i * 4 + c };
                 R[i][c] = p;
             } else {
                 R[i][c] = sym_bad();
@@ -1326,7 +1398,7 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
             bool force = (cf >> 13) & 1, predj = (cf >> 14) & 1;
             bool cond = (cf >> 42) & 1;
             if (predj) {
-                return;
+                PS_FAIL();
             }
             if (force || bool_const(s, (cf >> 34) & 0xff) == cond) {
                 next = cf & 0x3ff;
@@ -1335,32 +1407,32 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
             continue;
         }
         default:
-            return;                     /* loops, calls, predicates */
+            PS_FAIL();                     /* loops, calls, predicates */
         }
         end = opc == 2 || opc == 4 || opc == 14;
         uint32_t addr = cf & 0x1ff, count = (cf >> 12) & 7;
         uint32_t serial = (cf >> 16) & 0xfff;
         for (uint32_t i = 0; i < count; i++) {
             if (addr + i >= limit) {
-                return;
+                PS_FAIL();
             }
             const uint32_t *w = &prog[3 * (addr + i)];
             uint32_t d0 = w[0], d1 = w[1], d2 = w[2];
             if ((serial >> (2 * i)) & 1) {
                 /* texture fetch from an interpolated input */
                 if (((d1 >> 31) & 1) || (d0 & 0x1f) != 1 || f->has_tex) {
-                    return;
+                    PS_FAIL();
                 }
                 uint32_t src = (d0 >> 5) & 0x3f, dst = (d0 >> 12) & 0x3f;
                 uint32_t sswz = (d0 >> 26) & 0x3f, dswz = d1 & 0xfff;
                 if (((d0 >> 11) & 1) || ((d0 >> 18) & 1)) {
-                    return;
+                    PS_FAIL();
                 }
                 Sym u = R[src][sswz & 3], v = R[src][(sswz >> 2) & 3];
-                if (u.k != SYM_NONE || v.k != SYM_NONE || u.m < 0 ||
+                if (u.k || v.k || u.m < 0 ||
                     v.m < 0 || u.c != 1.0f || v.c != 1.0f || u.b != 0.0f ||
                     v.b != 0.0f || u.m / 4 != v.m / 4) {
-                    return;
+                    PS_FAIL();
                 }
                 f->has_tex = true;
                 f->tcidx = (d0 >> 20) & 0x1f;
@@ -1375,7 +1447,8 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
                 for (int c = 0; c < 4; c++) {
                     uint32_t sel = (dswz >> (3 * c)) & 7;
                     if (sel < 4) {
-                        Sym t = { 1.0f, 0.0f, 0.0f, (int)sel, SYM_NONE };
+                        Sym t = { { 0, 0, 0, 0 }, 0.0f, 0.0f, 1 << sel, SYM_NONE };
+                        t.a[sel] = 1.0f;
                         R[dst][c] = t;
                     } else if (sel == 5) {
                         R[dst][c] = sym_c(1.0f);
@@ -1404,14 +1477,14 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
                 ((d0 >> 6) & 1) || vop >= 20 || (sop >= 23 && sop != 25 &&
                 sop != 26 && sop != 40 && sop != 48 && sop != 49 &&
                 sop != 50) || (!exp && sdst_rel)) {
-                return;                 /* side effects or addressing */
+                PS_FAIL();                 /* side effects or addressing */
             }
             for (int k = 0; k < 3; k++) {
                 Sym raw[4];
                 bool absv;
                 if (istemp[k]) {
                     if (sreg[k] & 0x40) {
-                        return;
+                        PS_FAIL();
                     }
                     memcpy(raw, R[sreg[k] & 63], sizeof(raw));
                     absv = sreg[k] & 0x80;
@@ -1488,7 +1561,7 @@ static void ps_analyze(AdrenoState *s, DrawState *ds)
 
             if (exp) {
                 if (vdst != 0) {
-                    return;             /* only the colour export */
+                    PS_FAIL();             /* only the colour export */
                 }
                 uint32_t one = vmask & smask;
                 uint32_t zero = sdst_rel ? (0xf & ~(vmask | smask)) : 0;
@@ -1521,10 +1594,22 @@ finish:
         if (end) {
             for (int c = 0; c < 4; c++) {
                 if (!sym_ok(E[c])) {
-                    return;
+                    PS_FAIL();
                 }
                 f->out[c] = E[c];
                 f->uses_params |= E[c].m != SYM_NONE;
+            }
+            f->npm = 0;
+            for (int c = 0; c < 4; c++) {
+                int m = E[c].m, j;
+                if (m == SYM_NONE) {
+                    continue;
+                }
+                for (j = 0; j < f->npm && f->pm[j] != m; j++) {
+                }
+                if (j == f->npm) {
+                    f->pm[f->npm++] = m;   /* at most 4 outputs: fits */
+                }
             }
             f->ok = true;
             return;
@@ -1537,8 +1622,8 @@ finish:
 static inline float sym_eval(const Sym *o, const float *tx, const V4 *in)
 {
     float v = o->b;
-    if (o->k >= 0) {
-        v += o->a * tx[o->k];
+    if (o->k) {
+        v += o->a[0] * tx[0] + o->a[1] * tx[1] + o->a[2] * tx[2] + o->a[3] * tx[3];
     }
     if (o->m >= 0) {
         v += o->c * in[o->m >> 2].f[o->m & 3];
@@ -1558,13 +1643,45 @@ static uint8_t *rt_color(DrawState *ds, int x, int y, int bpp, uint32_t ns)
     uint32_t off = ds->clinear ? (y * ds->pitch + x) * bpp
                                : tiled_offset(x, y, ds->pitch, bpp);
     uint32_t va = ds->cbase + off;
-    uint8_t *hp = adreno_host_page(s, va);
+    uint8_t *hp = adreno_host_page_c(s, &ds->rc->mc, va);
     if (!hp || (va & 4095) + bpp > 4096) {
         return NULL;
     }
     ds->dirty_lo = MIN(ds->dirty_lo, va);
     ds->dirty_hi = MAX(ds->dirty_hi, va + bpp);
     return hp + (va & 4095);
+}
+
+/* ADRENO_STATS: pixels of draws that miss fast_span, by draw state */
+typedef struct SpanMiss { uint64_t key, pixels; } SpanMiss;
+static SpanMiss span_miss[8];
+static uint64_t px_span;
+
+static void span_miss_note(const DrawState *ds, bool persp, uint64_t px)
+{
+    bool blend = !((ds->cctl >> 5) & 1) || ((ds->blend >> 29) & 1);
+    uint64_t key = (uint64_t)ds->cfmt | (uint64_t)ds->cswap << 4 |
+                   (uint64_t)ds->cmask << 6 | (uint64_t)(ds->zctl & 6) << 10 |
+                   (uint64_t)((ds->cctl >> 3) & 1) << 13 |
+                   (uint64_t)ds->sysmem << 14 | (uint64_t)persp << 15 |
+                   (uint64_t)ds->fast.ok << 16 | (uint64_t)blend << 17 |
+                   (uint64_t)MIN(ds->samples, 15u) << 18 |
+                   (uint64_t)(blend ? ds->blend : 0) << 32;
+    int k, least = 0;
+    for (k = 0; k < 8; k++) {
+        if (span_miss[k].key == key && span_miss[k].pixels) {
+            break;
+        }
+        if (span_miss[k].pixels < span_miss[least].pixels) {
+            least = k;
+        }
+    }
+    if (k == 8) {
+        k = least;
+        span_miss[k].key = key;
+        span_miss[k].pixels = 0;
+    }
+    span_miss[k].pixels += px;
 }
 
 static void shade_pixel(DrawState *ds, int x, int y, float z, const V4 *in)
@@ -1609,12 +1726,8 @@ static void shade_pixel(DrawState *ds, int x, int y, float z, const V4 *in)
         FastPS *f = &ds->fast;
         float tx[4] = { 0, 0, 0, 0 };
         if (f->has_tex) {
-            if (!(tic_valid & (1u << f->tcidx))) {
-                tex_info(s, f->tcidx, &tic[f->tcidx]);
-                tic_valid |= 1u << f->tcidx;
-            }
-            const TexInfo *ti = &tic[f->tcidx];
-            tex_sample(s, ti, in[f->param].f[f->uc], in[f->param].f[f->vc],
+            const TexInfo *ti = rc_tex(s, ds->rc, f->tcidx);
+            tex_sample(s, &ds->rc->mc, ti, in[f->param].f[f->uc], in[f->param].f[f->vc],
                        f->denorm, f->mag == 3 ? ti->mag : f->mag, tx);
         }
         for (int c = 0; c < 4; c++) {
@@ -1754,7 +1867,7 @@ static void resolve_span(DrawState *ds, int x0, int x1, int y)
                       (ADRENO_GMEM_SIZE - 1);
         uint32_t len = (x1 - x0) * dbpp;
         if (so + len <= ADRENO_GMEM_SIZE) {
-            adreno_write(s, ds->cp_dest +
+            adreno_write_c(s, &ds->rc->mc, ds->cp_dest +
                          (dy * ds->cp_pitch + x0 + ds->cp_dx) * dbpp,
                          &s->gmem[so], len);
             ds->pixels += x1 - x0;
@@ -1768,21 +1881,21 @@ static void resolve_span(DrawState *ds, int x0, int x1, int y)
         if (linear) {
             uint32_t addr = ds->cp_dest + (dy * ds->cp_pitch + dx) * dbpp;
             if (wmask != 0xf) {
-                adreno_read(s, addr, buf, n * dbpp);
+                adreno_read_c(s, &ds->rc->mc, addr, buf, n * dbpp);
             }
             for (int i = 0; i < n; i++) {
                 resolve_px(ds, x0 + i, y, buf + i * dbpp);
             }
-            adreno_write(s, addr, buf, n * dbpp);
+            adreno_write_c(s, &ds->rc->mc, addr, buf, n * dbpp);
         } else {
             for (int i = 0; i < n; i++) {
                 uint32_t addr = ds->cp_dest +
                     tiled_offset(dx + i, dy, ds->cp_pitch, dbpp);
                 if (wmask != 0xf) {
-                    adreno_read(s, addr, buf, dbpp);
+                    adreno_read_c(s, &ds->rc->mc, addr, buf, dbpp);
                 }
                 resolve_px(ds, x0 + i, y, buf);
-                adreno_write(s, addr, buf, dbpp);
+                adreno_write_c(s, &ds->rc->mc, addr, buf, dbpp);
             }
         }
         x0 += n;
@@ -1798,9 +1911,9 @@ static bool fast_span_ok(const DrawState *ds, bool persp)
 {
     bool blend = !((ds->cctl >> 5) & 1) || ((ds->blend >> 29) & 1);
 
-    return ds->fast.ok && !ds->fast.uses_params && !persp && ds->mode == 4 &&
+    return ds->fast.ok && !persp && ds->mode == 4 &&
            !ds->sysmem &&
-           !(ds->zctl & 6) &&
+           !(ds->zctl & 2) &&          /* no Z test (and so no Z write) */
            !((ds->cctl >> 3) & 1) && ds->samples == 1 && ds->cfmt == 5 &&
            ds->cswap == 0 && ds->cmask == 0xf &&
            (!blend || ds->blend == 0x00010001 || ds->blend == 0x07010701 ||
@@ -1808,7 +1921,7 @@ static bool fast_span_ok(const DrawState *ds, bool persp)
 }
 
 static void fast_span(DrawState *ds, int xa, int xb, int y, float u, float v,
-                      float du, float dv)
+                      float du, float dv, float *pv, const float *pdv)
 {
     AdrenoState *s = ds->s;
     const FastPS *f = &ds->fast;
@@ -1819,23 +1932,46 @@ static void fast_span(DrawState *ds, int xa, int xb, int y, float u, float v,
     const TexInfo *ti = NULL;
     float tx[4] = { 0, 0, 0, 0 };
     int filter = 0;
+    /* the outputs as kb + ka . texel + kc * input, inputs stepped per pixel */
+    float ka[4][4], kb[4], kc[4], pl[5] = { 0, 0, 0, 0, 0 }, pdl[4] = { 0, 0, 0, 0 };
+    int kp[4];
+
+    for (int i = 0; i < 4; i++) {
+        const Sym *o = &f->out[i];
+        for (int k = 0; k < 4; k++) {
+            ka[i][k] = o->k ? o->a[k] : 0.0f;
+        }
+        kb[i] = o->b;
+        kc[i] = 0.0f;
+        kp[i] = 4;
+        for (int j = 0; j < f->npm; j++) {
+            if (o->m == f->pm[j]) {
+                kc[i] = o->c;
+                kp[i] = j;
+            }
+        }
+    }
+    for (int j = 0; j < f->npm; j++) {
+        pl[j] = pv[j];
+        pdl[j] = pdv[j];
+    }
 
     off &= ADRENO_GMEM_SIZE - 1;
     if (off + (uint32_t)(xb - xa + 1) * 4 > ADRENO_GMEM_SIZE) {
         /* the row wraps around the end of GMEM: split it */
         int first = (ADRENO_GMEM_SIZE - off) / 4;
         float k = (float)first;
-        fast_span(ds, xa, xa + first - 1, y, u, v, du, dv);
-        fast_span(ds, xa + first, xb, y, u + du * k, v + dv * k, du, dv);
+        float pv2[4];
+        for (int j = 0; j < ds->fast.npm; j++) {
+            pv2[j] = pv[j] + pdv[j] * k;
+        }
+        fast_span(ds, xa, xa + first - 1, y, u, v, du, dv, pv, pdv);
+        fast_span(ds, xa + first, xb, y, u + du * k, v + dv * k, du, dv, pv2, pdv);
         return;
     }
     uint8_t *cp = &s->gmem[off];
     if (f->has_tex) {
-        if (!(tic_valid & (1u << f->tcidx))) {
-            tex_info(s, f->tcidx, &tic[f->tcidx]);
-            tic_valid |= 1u << f->tcidx;
-        }
-        ti = &tic[f->tcidx];
+        ti = rc_tex(s, ds->rc, f->tcidx);
         filter = f->mag == 3 ? ti->mag : f->mag;
     }
     /*
@@ -1860,12 +1996,86 @@ static void fast_span(DrawState *ds, int xa, int xb, int y, float u, float v,
             va = ti->base + (ty * ti->pitch + tx0) * ti->bpp;
         }
     }
-    for (int x = xa; x <= xb; x++, cp += 4, u += du, v += dv) {
+    /*
+     * Integer loop for the bulk of composition: an RGBA8888 texture
+     * copied 1:1, each output a texel channel (or 0/1) times one constant
+     * (the layer's alpha), opaque or premultiplied source-over.
+     */
+    int x = xa;
+    if (walk && ti->fmt == 6 && !f->npm && bmode < 2) {
+        int src[4];
+        float m = -1.0f;
+        bool ok = true;
+        for (int i = 0; i < 4 && ok; i++) {
+            int n = 0, k0 = -1;
+            for (int k = 0; k < 4; k++) {
+                if (ka[i][k] != 0.0f) {
+                    n++;
+                    k0 = k;
+                }
+            }
+            if (kb[i] != 0.0f || n > 1) {
+                ok = false;
+                break;
+            }
+            if (!n) {
+                src[i] = 5;                     /* 0 */
+                continue;
+            }
+            if (m < 0) {
+                m = ka[i][k0];
+            }
+            uint32_t sw = ti->swz[k0];
+            src[i] = sw < 4 ? (int)sw : sw == 5 ? 4 : 5;
+            ok = ka[i][k0] == m;
+        }
+        if (ok && m < 0) {
+            m = 1.0f;
+        }
+        if (ok && m > 0.0f && m <= 1.0f) {
+            uint32_t M = (uint32_t)(m * 256.0f + 0.5f);
+            for (; x <= xb; x++, cp += 4, va += 4) {
+                if (!hp || !(va & 4095)) {
+                    hp = adreno_host_page_c(s, &ds->rc->mc, va);
+                    if (!hp) {
+                        break;
+                    }
+                }
+                const uint8_t *q = hp + (va & 4095);
+                uint32_t sv[4];
+                for (int i = 0; i < 4; i++) {
+                    uint32_t b = src[i] < 4 ? q[src[i]] : src[i] == 4 ? 255 : 0;
+                    sv[i] = (b * M + 128) >> 8;
+                }
+                if (bmode && sv[3] != 255) {
+                    uint32_t ia = 255 - sv[3];
+                    for (int i = 0; i < 4; i++) {
+                        uint32_t t = cp[i] * ia + 128;
+                        t = sv[i] + ((t + (t >> 8)) >> 8);
+                        cp[i] = t > 255 ? 255 : t;
+                    }
+                } else {
+                    for (int i = 0; i < 4; i++) {
+                        cp[i] = sv[i];
+                    }
+                }
+            }
+            ds->pixels += x - xa;
+            if (x > xb) {
+                return;
+            }
+            walk = false;               /* unmapped page: sample the rest */
+            u += du * (x - xa);
+            v += dv * (x - xa);
+        }
+    }
+    int xf = x;
+    for (; x <= xb; x++, cp += 4, u += du, v += dv) {
         float c[4];
         if (walk) {
             float raw[4];
             if (!hp || !(va & 4095)) {
-                hp = adreno_host_page(s, va);
+                hp = adreno_host_page_c(s, &ds->rc->mc, va);
                 if (!hp) {
                     walk = false;
                     goto sample;
@@ -1891,10 +2101,14 @@ static void fast_span(DrawState *ds, int xa, int xb, int y, float u, float v,
             }
         } else if (ti) {
 sample:
-            tex_sample(s, ti, u, v, f->denorm, filter, tx);
+            tex_sample(s, &ds->rc->mc, ti, u, v, f->denorm, filter, tx);
         }
         for (int i = 0; i < 4; i++) {
-            c[i] = sym_eval(&f->out[i], tx, NULL);
+            c[i] = kb[i] + ka[i][0] * tx[0] + ka[i][1] * tx[1] +
+                   ka[i][2] * tx[2] + ka[i][3] * tx[3] + kc[i] * pl[kp[i]];
+        }
+        for (int j = 0; j < 4; j++) {
+            pl[j] += pdl[j];
         }
         if (bmode) {
             float ia = 1.0f - c[3];
@@ -1910,10 +2124,12 @@ sample:
         }
         for (int i = 0; i < 4; i++) {
             float q = c[i] * 255.0f + 0.5f;
-            cp[i] = q >= 255.0f ? 255 : q > 0.0f ? (uint8_t)q : 0;
+            q = q > 0.0f ? q : 0.0f;
+            q = q < 255.0f ? q : 255.0f;
+            cp[i] = (uint8_t)(int)q;
         }
-        ds->pixels++;
     }
+    ds->pixels += xb - xf + 1;
 }
 
 /* ---------------- rasterizer ---------------- */
@@ -1938,7 +2154,7 @@ static void raster_tri(DrawState *ds, const PVtx *v0, const PVtx *v1,
         return;
     }
     /* culling: window y grows downwards */
-    uint32_t sc = ds->s->regs[A2XX_PA_SU_SC_MODE_CNTL];
+    uint32_t sc = ds->nocull ? 0 : ds->s->regs[A2XX_PA_SU_SC_MODE_CNTL];
     bool ccw_front = !((sc >> 2) & 1);
     bool is_front = (area < 0) == ccw_front;
     if ((is_front && (sc & 1)) || (!is_front && (sc & 2))) {
@@ -1980,8 +2196,12 @@ static void raster_tri(DrawState *ds, const PVtx *v0, const PVtx *v1,
     bool persp = ds->persp &&
                  !(v0->rw == v1->rw && v1->rw == v2->rw);
     bool fast = fast_span_ok(ds, persp);
+    uint64_t px_before = ds->pixels;
 
     for (int y = miny; y <= maxy; y++) {
+        if (ds->nparts > 1 && ((y >> RP_ROWS_SHIFT) % ds->nparts) != ds->part) {
+            continue;
+        }
         float py = y + 0.5f, px0 = minx + 0.5f;
         float e0 = edge(v1->x, v1->y, v2->x, v2->y, px0, py);
         float e1 = edge(v2->x, v2->y, v0->x, v0->y, px0, py);
@@ -2034,7 +2254,15 @@ static void raster_tri(DrawState *ds, const PVtx *v0, const PVtx *v1,
                 du = (s0 * p0->f[uc] + s1 * p1->f[uc] + s2 * p2->f[uc]) * inv;
                 dv = (s0 * p0->f[vc] + s1 * p1->f[vc] + s2 * p2->f[vc]) * inv;
             }
-            fast_span(ds, xa, xb, y, u, vv, du, dv);
+            float pv[4], pdv[4];
+            for (int j = 0; j < ds->fast.npm; j++) {
+                int m = ds->fast.pm[j];
+                float q0 = v0->p[m >> 2].f[m & 3], q1 = v1->p[m >> 2].f[m & 3];
+                float q2 = v2->p[m >> 2].f[m & 3];
+                pv[j] = c0 * q0 + c1 * q1 + c2 * q2;
+                pdv[j] = (s0 * q0 + s1 * q1 + s2 * q2) * inv;
+            }
+            fast_span(ds, xa, xb, y, u, vv, du, dv, pv, pdv);
             continue;
         }
 
@@ -2090,6 +2318,13 @@ static void raster_tri(DrawState *ds, const PVtx *v0, const PVtx *v1,
             resolve_span(ds, run, xb + 1, y);
         }
     }
+    if (ds->mode == 4) {
+        if (fast) {
+            px_span += ds->pixels - px_before;
+        } else {
+            span_miss_note(ds, persp, ds->pixels - px_before);
+        }
+    }
 }
 
 /* rectangle from 3 corners: find the right-angle corner, add the fourth */
@@ -2111,11 +2346,11 @@ static void raster_rect(DrawState *ds, const PVtx *v)
                 }
             }
             /* draw both halves regardless of winding */
-            uint32_t sc = ds->s->regs[A2XX_PA_SU_SC_MODE_CNTL];
-            ds->s->regs[A2XX_PA_SU_SC_MODE_CNTL] = sc & ~3u;
+            bool nocull = ds->nocull;
+            ds->nocull = true;
             raster_tri(ds, o, a, b);
             raster_tri(ds, a, &d, b);
-            ds->s->regs[A2XX_PA_SU_SC_MODE_CNTL] = sc;
+            ds->nocull = nocull;
             return;
         }
     }
@@ -2130,6 +2365,7 @@ static void run_vs(AdrenoState *s, DrawState *ds, uint32_t index, PVtx *out)
     uint32_t vte = s->regs[A2XX_PA_CL_VTE_CNTL];
 
     memset(&t, 0, sizeof(t));
+    t.rc = ds->rc;
     t.stage = ST_VS;
     t.r[0].f[0] = (float)index;
     run_shader(s, &t, adreno_prog_base(s, 0));
@@ -2171,6 +2407,23 @@ static void run_vs(AdrenoState *s, DrawState *ds, uint32_t index, PVtx *out)
     }
 }
 
+static uint32_t gmem_stride(const DrawState *ds, int right)
+{
+    int bpp = fmt_bpp_rb(ds->cfmt);
+    uint32_t pitch = ds->reg_pitch, need = MAX(right, 1);
+
+    if (ds->samples != 1) {
+        return pitch;
+    }
+    if ((uint64_t)pitch * ds->bin_h * bpp > ADRENO_GMEM_SIZE && ds->bin_w < pitch) {
+        return (ds->bin_w + 31) & ~31u;
+    }
+    if (need > pitch) {
+        return (need + 31) & ~31u;
+    }
+    return pitch;
+}
+
 static void setup_draw(AdrenoState *s, DrawState *ds)
 {
     uint32_t r;
@@ -2178,6 +2431,8 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
     memset(ds, 0, sizeof(*ds));
     ds->pt.stage = ST_PS;
     ds->s = s;
+    ds->rc = ds->pt.rc = &rctx[0];
+    ds->nparts = 1;
     ds->mode = s->regs[A2XX_RB_MODECONTROL] & 7;
     r = s->regs[A2XX_RB_COLOR_INFO];
     ds->cfmt = r & 0xf;
@@ -2212,36 +2467,6 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
     ds->param_gen = (r >> 18) & 1;
     ds->param_gen_pos = (s->regs[A2XX_SQ_CONTEXT_MISC] >> 8) & 0xff;
     ds->nparams = MIN(16u, ((r >> 20) & 0xf) + 1);
-    static int nofast = -1;
-    if (nofast < 0) {
-        nofast = getenv("ADRENO_NOFAST") != NULL;
-    }
-    if (ds->mode == 4 && !nofast) {
-        ps_analyze(s, ds);
-        stat_fast += ds->fast.ok;
-        if (!ds->fast.ok) {
-            /* name each slow pixel shader once, for fast-path work */
-            static uint32_t seen[32];
-            static int nseen;
-            uint32_t h = 2166136261u;
-            for (uint32_t i = 0; i < 48; i++) {
-                h = (h ^ s->istore[ds->ps_base * 3 + i]) * 16777619u;
-            }
-            bool known = false;
-            for (int i = 0; i < nseen; i++) {
-                known |= seen[i] == h;
-            }
-            if (!known && nseen < 32) {
-                seen[nseen++] = h;
-                qemu_log_mask(LOG_UNIMP, "adreno: slow pixel shader %08x:", h);
-                for (uint32_t i = 0; i < 48; i++) {
-                    qemu_log_mask(LOG_UNIMP, " %08x",
-                                  s->istore[ds->ps_base * 3 + i]);
-                }
-                qemu_log_mask(LOG_UNIMP, "\n");
-            }
-        }
-    }
     ds->cp_dest = s->regs[A2XX_RB_COPY_DEST_BASE];
     ds->cp_pitch = (s->regs[A2XX_RB_COPY_DEST_PITCH] & 0x1ff) << 5;
     ds->cp_info = s->regs[A2XX_RB_COPY_DEST_INFO];
@@ -2275,17 +2500,22 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
      * (the bin size), like the pitch freedreno and older blobs use.
      */
     if (!ds->sysmem) {
-        int bpp = fmt_bpp_rb(ds->cfmt);
         uint32_t bw = (uint32_t)MAX(sx1 - sx0, 1), bh = (uint32_t)MAX(sy1, 1);
         /*
          * ICS does the opposite: 256x246 bins with pitch 128, whose rows
          * would overlap.  In both cases the bin width is the real stride.
          */
-        if (ds->samples == 1 &&
-            (((uint64_t)ds->pitch * bh * bpp > ADRENO_GMEM_SIZE && bw < ds->pitch) ||
-             bw > ds->pitch)) {
-            ds->pitch = (bw + 31) & ~31u;
-        }
+        /*
+         * Pixels are addressed from x = 0, so a row must also reach the
+         * scissor's right edge: JB's partial updates render a dirty
+         * rectangle (status bar clock: x 404..471) with pitch 256 and
+         * resolve the whole 480 wide surface afterwards.  Both then get
+         * the same stride.
+         */
+        ds->bin_w = bw;
+        ds->bin_h = bh;
+        ds->reg_pitch = ds->pitch;
+        ds->pitch = gmem_stride(ds, MAX(sx1, 1));
     }
 }
 
@@ -2294,7 +2524,7 @@ static void setup_draw(AdrenoState *s, DrawState *ds)
 /* state was loaded (snapshot): drop caches derived from the old state */
 void adreno_draw_post_load(AdrenoState *s)
 {
-    tic_valid = 0;
+    rc_invalidate_tex();
 }
 
 void adreno_draw_reset(AdrenoState *s)
@@ -2384,6 +2614,345 @@ static void dump_state(AdrenoState *s, uint32_t op, const uint32_t *d,
 
 #define MAX_VERTS 65536
 
+/*
+ * Choose the pixel shader path once the vertices are known: the ranges of
+ * the interpolated inputs let saturations of them be proven no-ops.
+ */
+static void analyze_ps(AdrenoState *s, DrawState *ds, uint32_t prim, PVtx **vs,
+                       uint32_t count)
+{
+    static int nofast = -1;
+    float plo[64], phi[64];
+
+    if (nofast < 0) {
+        nofast = getenv("ADRENO_NOFAST") != NULL;
+    }
+    for (int i = 0; i < 64; i++) {
+        plo[i] = INFINITY;
+        phi[i] = -INFINITY;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        for (uint32_t m = 0; m < ds->nparams * 4; m++) {
+            float v = vs[i]->p[m >> 2].f[m & 3];
+            plo[m] = MIN(plo[m], v);
+            phi[m] = MAX(phi[m], v);
+        }
+    }
+    if (prim == 8) {
+        /* rectangles: the fourth corner is extrapolated from the other three */
+        for (uint32_t i = 0; i + 2 < count; i += 3) {
+            for (int o = 0; o < 3; o++) {
+                const PVtx *a = vs[i + (o + 1) % 3], *b = vs[i + (o + 2) % 3];
+                const PVtx *v0 = vs[i + o];
+                for (uint32_t m = 0; m < ds->nparams * 4; m++) {
+                    float v = a->p[m >> 2].f[m & 3] + b->p[m >> 2].f[m & 3] -
+                              v0->p[m >> 2].f[m & 3];
+                    plo[m] = MIN(plo[m], v);
+                    phi[m] = MAX(phi[m], v);
+                }
+            }
+        }
+    }
+    for (int m = 0; m < 64; m++) {
+        if (!isfinite(plo[m]) || !isfinite(phi[m])) {
+            plo[m] = 1;
+            phi[m] = 0;                 /* unknown: lo > hi */
+        }
+    }
+    if (ds->mode == 4 && !nofast) {
+        sym_plo = plo;
+        sym_phi = phi;
+        ps_analyze(s, ds);
+        sym_plo = sym_phi = NULL;
+        stat_fast += ds->fast.ok;
+        if (!ds->fast.ok) {
+            /* name each slow pixel shader once, for fast-path work */
+            static uint32_t seen[32];
+            static int nseen;
+            uint32_t h = 2166136261u;
+            for (uint32_t i = 0; i < 48; i++) {
+                h = (h ^ s->istore[ds->ps_base * 3 + i]) * 16777619u;
+            }
+            bool known = false;
+            for (int i = 0; i < nseen; i++) {
+                known |= seen[i] == h;
+            }
+            if (!known && nseen < 32) {
+                seen[nseen++] = h;
+                qemu_log_mask(LOG_UNIMP, "adreno: slow pixel shader %08x:", h);
+                for (uint32_t i = 0; i < 48; i++) {
+                    qemu_log_mask(LOG_UNIMP, " %08x",
+                                  s->istore[ds->ps_base * 3 + i]);
+                }
+                qemu_log_mask(LOG_UNIMP, "\n");
+            }
+        }
+    }
+}
+
+/* ---------------- primitives, split over threads ---------------- */
+
+static void raster_prims(DrawState *ds, uint32_t prim, PVtx **vs, uint32_t count)
+{
+    switch (prim) {
+    case 4:                             /* TRILIST */
+        for (uint32_t i = 0; i + 2 < count; i += 3) {
+            raster_tri(ds, vs[i], vs[i + 1], vs[i + 2]);
+        }
+        break;
+    case 5:                             /* TRIFAN */
+        for (uint32_t i = 1; i + 1 < count; i++) {
+            raster_tri(ds, vs[0], vs[i], vs[i + 1]);
+        }
+        break;
+    case 6:                             /* TRISTRIP */
+        for (uint32_t i = 0; i + 2 < count; i++) {
+            if (i & 1) {
+                raster_tri(ds, vs[i + 1], vs[i], vs[i + 2]);
+            } else {
+                raster_tri(ds, vs[i], vs[i + 1], vs[i + 2]);
+            }
+        }
+        break;
+    case 8:                             /* RECTLIST */
+        for (uint32_t i = 0; i + 2 < count; i += 3) {
+            PVtx r3[3] = { *vs[i], *vs[i + 1], *vs[i + 2] };
+            raster_rect(ds, r3);
+        }
+        break;
+    default: {
+        static bool warned[64];
+        if (!warned[prim]) {
+            warned[prim] = true;
+            qemu_log_mask(LOG_UNIMP, "adreno: primitive type %u\n", prim);
+        }
+        break;
+    }
+    }
+}
+
+/*
+ * Big draws are rasterized by the GPU thread and up to RP_MAX - 1 worker
+ * threads at once, each taking every nparts-th band of 1 << RP_ROWS_SHIFT
+ * rows.  Primitive order is kept within each pixel, and the bands touch
+ * disjoint GMEM and memory, so the result is the same as drawn by one
+ * thread.  The vertices are shaded beforehand by the GPU thread.
+ *
+ * ADRENO_THREADS=n sets the number of parts (default 1 = off, 0 = the
+ * number of CPUs the emulator may use minus one, at most 4).  Most draws
+ * of Android's UI are a few thousand pixels, too small to gain from it
+ * yet, so it stays off by default.
+ */
+static uint64_t rp_min_pixels = 8192;   /* smaller draws: not worth a wake-up */
+static int64_t rp_spin_ns = 200000;     /* workers spin this long for a next draw */
+
+static struct {
+    int nparts;
+    QemuThread th[RP_MAX];
+    QemuSemaphore go[RP_MAX];
+    int sleeping[RP_MAX];
+    uint32_t seq, done;
+    /* the current job */
+    const DrawState *ds;
+    uint32_t prim, count;
+    PVtx **vs;
+    DrawState part[RP_MAX];
+} rp;
+
+static void rp_run(int k)
+{
+    DrawState *d = &rp.part[k];
+
+    *d = *rp.ds;
+    d->rc = d->pt.rc = &rctx[k];
+    d->part = k;
+    d->nparts = rp.nparts;
+    d->dirty_lo = UINT32_MAX;
+    d->dirty_hi = 0;
+    d->pixels = 0;
+    rctx[k].tic_valid = 0;
+    raster_prims(d, rp.prim, rp.vs, rp.count);
+}
+
+static void *rp_worker(void *opaque)
+{
+    int k = (intptr_t)opaque;
+    uint32_t seen = 0;
+
+    rcu_register_thread();
+    for (;;) {
+        int64_t t0 = 0;
+        int spins = 0;
+        while (qatomic_load_acquire(&rp.seq) == seen) {
+            if (++spins & 63) {
+                cpu_relax();
+                continue;
+            }
+            int64_t now = get_clock();
+            if (!t0) {
+                t0 = now;
+                continue;
+            }
+            if (now - t0 < rp_spin_ns) {
+                continue;
+            }
+            /* sleep until the next draw; see rp_draw for the hand-shake */
+            qatomic_set(&rp.sleeping[k], 1);
+            smp_mb();
+            if (qatomic_read(&rp.seq) == seen || !qatomic_xchg(&rp.sleeping[k], 0)) {
+                qemu_sem_wait(&rp.go[k]);
+            }
+            t0 = 0;
+        }
+        seen = qatomic_read(&rp.seq);
+        rp_run(k);
+        qatomic_inc(&rp.done);
+    }
+    return NULL;
+}
+
+static void rp_init(void)
+{
+    const char *e = getenv("ADRENO_THREADS");
+    int n = 1;
+
+    if (e) {
+        n = atoi(e);
+#ifdef __linux__
+        if (n <= 0) {                   /* 0: one per CPU we may use, but one */
+            cpu_set_t set;
+            n = sched_getaffinity(0, sizeof(set), &set) == 0 ?
+                MIN(CPU_COUNT(&set) - 1, 4) : 1;
+        }
+#endif
+    }
+    rp.nparts = MAX(1, MIN(n, RP_MAX));
+    if ((e = getenv("ADRENO_RP_MIN"))) {
+        rp_min_pixels = atoi(e);
+    }
+    if ((e = getenv("ADRENO_RP_SPIN_US"))) {
+        rp_spin_ns = atoi(e) * 1000LL;
+    }
+    for (int k = 1; k < rp.nparts; k++) {
+        char name[32];
+        qemu_sem_init(&rp.go[k], 0);
+        snprintf(name, sizeof(name), "adreno-rast%d", k);
+        qemu_thread_create(&rp.th[k], name, rp_worker, (void *)(intptr_t)k,
+                           QEMU_THREAD_DETACHED);
+    }
+    if (rp.nparts > 1) {
+        info_report("adreno: rasterizing on %d threads", rp.nparts);
+    }
+}
+
+/* pixels a draw may cover: the vertices' box within the scissor */
+static uint64_t draw_area(const DrawState *ds, PVtx **vs, uint32_t count)
+{
+    float x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+
+    for (uint32_t i = 0; i < count; i++) {
+        x0 = MIN(x0, vs[i]->x);
+        y0 = MIN(y0, vs[i]->y);
+        x1 = MAX(x1, vs[i]->x);
+        y1 = MAX(y1, vs[i]->y);
+    }
+    x0 = MAX(x0, ds->sx0);
+    y0 = MAX(y0, ds->sy0);
+    x1 = MIN(x1, ds->sx1);
+    y1 = MIN(y1, ds->sy1);
+    if (!(x1 > x0 && y1 > y0)) {
+        return 0;
+    }
+    return (uint64_t)(x1 - x0) * (uint64_t)(y1 - y0);
+}
+
+static void raster_draw(DrawState *ds, uint32_t prim, PVtx **vs, uint32_t count)
+{
+    static bool inited;
+
+    if (!inited) {
+        inited = true;
+        rp_init();
+    }
+    if (rp.nparts < 2 || adreno_trace ||
+        (prim == 8 ? 2 : 1) * draw_area(ds, vs, count) < rp_min_pixels) {
+        ds->rc->tic_valid = 0;
+        raster_prims(ds, prim, vs, count);
+        return;
+    }
+    rp.ds = ds;
+    rp.prim = prim;
+    rp.vs = vs;
+    rp.count = count;
+    qatomic_set(&rp.done, 0);
+    qatomic_store_release(&rp.seq, rp.seq + 1);
+    smp_mb();
+    for (int k = 1; k < rp.nparts; k++) {
+        if (qatomic_xchg(&rp.sleeping[k], 0)) {
+            qemu_sem_post(&rp.go[k]);
+        }
+    }
+    rp_run(0);
+    for (int spins = 0; qatomic_load_acquire(&rp.done) != rp.nparts - 1; spins++) {
+        if (spins < 100000) {
+            cpu_relax();
+        } else {
+            sched_yield();
+        }
+    }
+    ds->dirty_lo = UINT32_MAX;
+    ds->dirty_hi = 0;
+    for (int k = 0; k < rp.nparts; k++) {
+        ds->dirty_lo = MIN(ds->dirty_lo, rp.part[k].dirty_lo);
+        ds->dirty_hi = MAX(ds->dirty_hi, rp.part[k].dirty_hi);
+        ds->pixels += rp.part[k].pixels;
+    }
+}
+
+static DrawState last_slow = { .ps_base = UINT32_MAX };
+
+/*
+ * GMEM area rendered since the last resolve.  A resolve copies only that
+ * part: around a partial update GMEM holds whatever the previous pass
+ * (another app) left there, and the destination keeps its old pixels.
+ */
+static struct {
+    bool valid, after_resolve;
+    int x0, y0, x1, y1;
+    uint32_t cbase;
+} pass;
+
+static void pass_track(DrawState *ds)
+{
+    if (ds->sysmem) {
+        return;
+    }
+    if (ds->mode == 4) {
+        if (pass.after_resolve || !pass.valid || pass.cbase != ds->cbase) {
+            pass.valid = true;
+            pass.after_resolve = false;
+            pass.cbase = ds->cbase;
+            pass.x0 = ds->sx0;
+            pass.y0 = ds->sy0;
+            pass.x1 = ds->sx1;
+            pass.y1 = ds->sy1;
+        } else {
+            pass.x0 = MIN(pass.x0, ds->sx0);
+            pass.y0 = MIN(pass.y0, ds->sy0);
+            pass.x1 = MAX(pass.x1, ds->sx1);
+            pass.y1 = MAX(pass.y1, ds->sy1);
+        }
+    } else if (ds->mode == 6 && pass.valid && pass.cbase == ds->cbase &&
+               pass.x1 > pass.x0 && pass.y1 > pass.y0) {
+        ds->sx0 = MAX(ds->sx0, pass.x0);
+        ds->sy0 = MAX(ds->sy0, pass.y0);
+        ds->sx1 = MIN(ds->sx1, pass.x1);
+        ds->sy1 = MIN(ds->sy1, pass.y1);
+        ds->pitch = gmem_stride(ds, ds->sx1);
+        pass.after_resolve = true;
+    }
+}
+
 static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
 {
     DrawState ds;
@@ -2391,7 +2960,7 @@ static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
     uint32_t ibase = 0, isize = 0;
     const uint32_t *imm = NULL;
 
-    tic_valid = 0;
+    rc_invalidate_tex();
 
     if (n < 2) {
         return;
@@ -2441,6 +3010,10 @@ static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
     if (!count || count > MAX_VERTS || ds.sx0 >= ds.sx1 || ds.sy0 >= ds.sy1) {
         return;
     }
+    pass_track(&ds);
+    if (ds.sx0 >= ds.sx1 || ds.sy0 >= ds.sy1) {
+        return;
+    }
 
     /* indices */
     bool idx32 = (init >> 11) & 1, idx8 = (init >> 13) & 1;
@@ -2480,42 +3053,8 @@ static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
         vs[i] = v;
     }
 
-    /* primitives */
-    switch (prim) {
-    case 4:                             /* TRILIST */
-        for (uint32_t i = 0; i + 2 < count; i += 3) {
-            raster_tri(&ds, vs[i], vs[i + 1], vs[i + 2]);
-        }
-        break;
-    case 5:                             /* TRIFAN */
-        for (uint32_t i = 1; i + 1 < count; i++) {
-            raster_tri(&ds, vs[0], vs[i], vs[i + 1]);
-        }
-        break;
-    case 6:                             /* TRISTRIP */
-        for (uint32_t i = 0; i + 2 < count; i++) {
-            if (i & 1) {
-                raster_tri(&ds, vs[i + 1], vs[i], vs[i + 2]);
-            } else {
-                raster_tri(&ds, vs[i], vs[i + 1], vs[i + 2]);
-            }
-        }
-        break;
-    case 8:                             /* RECTLIST */
-        for (uint32_t i = 0; i + 2 < count; i += 3) {
-            PVtx r3[3] = { *vs[i], *vs[i + 1], *vs[i + 2] };
-            raster_rect(&ds, r3);
-        }
-        break;
-    default: {
-        static bool warned[64];
-        if (!warned[prim]) {
-            warned[prim] = true;
-            qemu_log_mask(LOG_UNIMP, "adreno: primitive type %u\n", prim);
-        }
-        break;
-    }
-    }
+    analyze_ps(s, &ds, prim, vs, count);
+    raster_draw(&ds, prim, vs, count);
     if (adreno_trace && s->draws >= (uint64_t)adreno_trace_from &&
         s->draws < (uint64_t)adreno_trace_from + adreno_trace_len) {
         for (uint32_t i = 0; i < MIN(count, 4u); i++) {
@@ -2544,7 +3083,13 @@ static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
         qemu_log("\n");
     }
     g_hash_table_destroy(cache);
+    if (ds.mode == 4 && !ds.fast.ok && ds.pixels) {
+        last_slow.ps_base = ds.ps_base;
+        last_slow.param_gen_pos = ps_fail;
+        last_slow.pixels = ds.pixels;
+    }
     if (ds.sysmem && ds.dirty_hi > ds.dirty_lo) {
+        adreno_watch_draw(s, ds.dirty_lo, ds.dirty_hi - ds.dirty_lo, "render");
         adreno_mark_dirty(s, ds.dirty_lo, ds.dirty_hi - ds.dirty_lo);
     }
 
@@ -2570,6 +3115,42 @@ static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
     }
 }
 
+/* slow-path (interpreted) pixel shaders by program, for ADRENO_STATS */
+typedef struct SlowPS { uint32_t hash, base, n; uint64_t pixels, draws; uint32_t w[48]; } SlowPS;
+static SlowPS slow_ps[16];
+
+static void slow_ps_note(AdrenoState *s, const DrawState *ds)
+{
+    uint32_t h = 2166136261u;
+    const uint32_t *w = &s->istore[ds->ps_base * 3];
+    int n = MIN(48, ADRENO_ISTORE_DWORDS - ds->ps_base * 3);
+    for (int i = 0; i < n; i++) {
+        h = (h ^ w[i]) * 16777619u;
+    }
+    int k, empty = -1, least = 0;
+    for (k = 0; k < 16; k++) {
+        if (slow_ps[k].hash == h && slow_ps[k].n) {
+            break;
+        }
+        if (!slow_ps[k].n && empty < 0) {
+            empty = k;
+        }
+        if (slow_ps[k].pixels < slow_ps[least].pixels) {
+            least = k;
+        }
+    }
+    if (k == 16) {
+        k = empty >= 0 ? empty : least;
+        memset(&slow_ps[k], 0, sizeof(slow_ps[k]));
+        slow_ps[k].hash = h;
+        slow_ps[k].n = n;
+        slow_ps[k].base = ds->param_gen_pos;    /* ps_analyze failure line */
+        memcpy(slow_ps[k].w, w, n * 4);
+    }
+    slow_ps[k].pixels += ds->pixels;
+    slow_ps[k].draws++;
+}
+
 /* ADRENO_STATS=1: log the host time spent drawing every 5 s */
 void adreno_draw(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
 {
@@ -2586,13 +3167,17 @@ void adreno_draw(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
     int64_t t0 = get_clock();
     uint32_t mode = s->regs[A2XX_RB_MODECONTROL] & 7;
     draw_one(s, op, d, n);
+    if (last_slow.ps_base != UINT32_MAX) {
+        slow_ps_note(s, &last_slow);
+        last_slow.ps_base = UINT32_MAX;
+    }
     int64_t t1 = get_clock();
     t_draw[mode] += t1 - t0;
     n_draw[mode]++;
     if (!t_start) {
         t_start = t1;
     } else if (t1 - t_start > 5000000000LL) {
-        qemu_log("adreno: stats %.1fs: render %" PRId64 " draws (%" PRIu64
+        fprintf(stderr, "adreno: stats %.1fs: render %" PRId64 " draws (%" PRIu64
                  " fast) %.0f ms,"
                  " resolve %" PRId64 " %.0f ms, other %.0f ms\n",
                  (t1 - t_start) / 1e9, n_draw[4], stat_fast, t_draw[4] / 1e6,
@@ -2600,6 +3185,27 @@ void adreno_draw(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
                  t_draw[6] / 1e6,
                  (t_draw[0] + t_draw[1] + t_draw[2] + t_draw[3] + t_draw[5] +
                   t_draw[7]) / 1e6);
+        for (int k = 0; k < 16; k++) {
+            if (slow_ps[k].pixels > 100000) {
+                fprintf(stderr, "adreno: slow ps %08x: %" PRIu64 " px %" PRIu64
+                        " draws fail@%u:", slow_ps[k].hash, slow_ps[k].pixels,
+                        slow_ps[k].draws, slow_ps[k].base);
+                for (uint32_t i = 0; i < slow_ps[k].n; i++) {
+                    fprintf(stderr, " %08x", slow_ps[k].w[i]);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        memset(slow_ps, 0, sizeof(slow_ps));
+        fprintf(stderr, "adreno: span px %" PRIu64 "\n", px_span);
+        for (int k = 0; k < 8; k++) {
+            if (span_miss[k].pixels) {
+                fprintf(stderr, "adreno: span miss %016" PRIx64 ": %" PRIu64 " px\n",
+                        span_miss[k].key, span_miss[k].pixels);
+            }
+        }
+        memset(span_miss, 0, sizeof(span_miss));
+        px_span = 0;
         memset(t_draw, 0, sizeof(t_draw));
         memset(n_draw, 0, sizeof(n_draw));
         stat_fast = 0;

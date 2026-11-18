@@ -24,6 +24,8 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include "qemu/timer.h"
+#include "hw/core/cpu.h"
+#include <sys/syscall.h>
 #include "msm.h"
 
 #define HL_MAGIC        0x4c324448      /* "HD2L" */
@@ -309,14 +311,88 @@ void leo_host_bench(void)
                 n * 1000.0 / MAX(t1 - t0, 1), cpu, x & 0xff);
 }
 
+/* threads the CPU report names; the GPU thread registers itself */
+static int leo_gpu_tid;
+
+void leo_thread_is_gpu(void)
+{
+    qatomic_set(&leo_gpu_tid, qemu_get_thread_id());
+}
+
+#ifdef __linux__
 /*
- * Every 10 s, log where the busiest emulator thread ran and how much CPU
- * it got: tells from a user's qemu.log whether it sat on a slow core.
+ * Ask the scheduler to treat a thread as needing at least [min]/1024 of
+ * the biggest core (Linux uclamp): EAS then prefers the prime core and
+ * schedutil keeps the clock up even while the thread is only half busy,
+ * which is how the vCPU and GPU threads run when they hand frames to each
+ * other.  Not every kernel or policy allows it; the result is logged.
+ */
+struct leo_sched_attr {
+    uint32_t size, policy;
+    uint64_t flags;
+    int32_t nice;
+    uint32_t prio;
+    uint64_t runtime, deadline, period;
+    uint32_t util_min, util_max;
+};
+
+static int leo_uclamp(int tid, unsigned min)
+{
+#ifdef SYS_sched_setattr
+    struct leo_sched_attr a = {
+        .size = sizeof(a),
+        .flags = 0x08 | 0x10 | 0x20,    /* KEEP_POLICY|KEEP_PARAMS|UTIL_CLAMP_MIN */
+        .util_min = min,
+    };
+    return syscall(SYS_sched_setattr, tid, &a, 0) == 0 ? 0 : -errno;
+#else
+    return -ENOSYS;
+#endif
+}
+
+static const char *leo_role(int tid)
+{
+    if (first_cpu && tid == first_cpu->thread_id) {
+        return "vCPU";
+    }
+    if (tid == qatomic_read(&leo_gpu_tid)) {
+        return "GPU";
+    }
+    if (tid == getpid()) {
+        return "main";
+    }
+    return "other";
+}
+
+static void leo_boost_threads(void)
+{
+    static bool done_cpu, done_gpu;
+    int gpu = qatomic_read(&leo_gpu_tid);
+
+    if (!done_cpu && first_cpu && first_cpu->thread_id > 0) {
+        int r = leo_uclamp(first_cpu->thread_id, 1024);
+        done_cpu = true;
+        info_report("htc-leo: vCPU thread %d boost: %s", first_cpu->thread_id,
+                    r ? strerror(-r) : "ok");
+    }
+    if (!done_gpu && gpu > 0) {
+        int r = leo_uclamp(gpu, 768);
+        done_gpu = true;
+        info_report("htc-leo: GPU thread %d boost: %s", gpu, r ? strerror(-r) : "ok");
+    }
+}
+#endif
+
+/*
+ * Every 10 s, log where the emulator's threads ran and how much CPU each
+ * got (vCPU, GPU, main loop, the rest summed): tells from a user's
+ * qemu.log whether the guest CPU or the GPU is the bottleneck, and whether
+ * it sat on a slow core.
  */
 void leo_cpu_report(void)
 {
 #ifdef __linux__
-    static int64_t last;
+    static int64_t last, last_log;
     static unsigned long prev_ticks[64];
     static int prev_tid[64];
     int64_t now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
@@ -324,13 +400,13 @@ void leo_cpu_report(void)
     const char *e;
     int best_tid = 0, best_cpu = -1, k = 0;
     unsigned long best = 0;
-    int tids[64];
-    unsigned long ticks[64];
+    int tids[64], cpus[64];
+    unsigned long ticks[64], deltas[64];
 
-    static int64_t last_log;
     if (now - last < 2000) {
         return;
     }
+    leo_boost_threads();
     d = g_dir_open("/proc/self/task", 0, NULL);
     if (!d) {
         return;
@@ -342,14 +418,11 @@ void leo_cpu_report(void)
             continue;
         }
         p = strrchr(txt, ')');
-        unsigned long ut = 0, st = 0;
-        int cpu = -1;
         /* fields after "(comm) ": state is #3, utime #14, stime #15, processor #39 */
         g_auto(GStrv) f = p ? g_strsplit(p + 2, " ", 0) : NULL;
         if (f && g_strv_length(f) > 36) {
-            ut = strtoul(f[11], NULL, 10);
-            st = strtoul(f[12], NULL, 10);
-            cpu = atoi(f[36]);
+            unsigned long ut = strtoul(f[11], NULL, 10);
+            unsigned long st = strtoul(f[12], NULL, 10);
             int tid = atoi(e);
             unsigned long delta = ut + st;
             for (int i = 0; i < 64; i++) {
@@ -359,12 +432,14 @@ void leo_cpu_report(void)
             }
             tids[k] = tid;
             ticks[k] = ut + st;
-            k++;
+            deltas[k] = delta;
+            cpus[k] = atoi(f[36]);
             if (delta > best) {
                 best = delta;
                 best_tid = tid;
-                best_cpu = cpu;
+                best_cpu = cpus[k];
             }
+            k++;
         }
         g_free(txt);
     }
@@ -378,17 +453,27 @@ void leo_cpu_report(void)
             info_report("htc-leo: re-pinned %d threads to the fast cores", n);
         }
     }
-    if (last && best_cpu >= 0 && now - last_log >= 10000) {
+    if (last && best_tid && now - last_log >= 10000) {
+        long per = sysconf(_SC_CLK_TCK) * (now - last) / 1000 + 1;
+        GString *g = g_string_new("");
+        unsigned long rest = 0;
         last_log = now;
-        char path[96], *f = NULL;
-        snprintf(path, sizeof(path),
-                 "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", best_cpu);
-        g_file_get_contents(path, &f, NULL, NULL);
-        info_report("htc-leo: busiest thread %d on CPU %d, %lu%% of a core%s%s",
-                    best_tid, best_cpu,
-                    best * 100 / (sysconf(_SC_CLK_TCK) * (now - last) / 1000 + 1),
-                    f ? ", MHz " : "", f ? g_strstrip(f) : "");
-        g_free(f);
+        for (int i = 0; i < k; i++) {
+            const char *r = leo_role(tids[i]);
+            if (!strcmp(r, "other")) {
+                rest += deltas[i];
+                continue;
+            }
+            char path[96], *f = NULL;
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", cpus[i]);
+            g_file_get_contents(path, &f, NULL, NULL);
+            g_string_append_printf(g, " %s %lu%% cpu%d%s%s,", r, deltas[i] * 100 / per,
+                                   cpus[i], f ? "@" : "", f ? g_strstrip(f) : "");
+            g_free(f);
+        }
+        info_report("htc-leo: threads:%s others %lu%%", g->str, rest * 100 / per);
+        g_string_free(g, true);
     }
     memset(prev_tid, 0, sizeof(prev_tid));
     for (int i = 0; i < k; i++) {

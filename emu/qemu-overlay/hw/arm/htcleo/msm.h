@@ -141,6 +141,7 @@ void leo_hostlink_audio_write(const uint8_t *pcm, uint32_t len);
 void leo_pin_fast_cpus(void);
 void leo_cpu_report(void);
 void leo_host_bench(void);
+void leo_thread_is_gpu(void);       /* called by the GPU thread */
 
 /* Press/release an HD2 hardware button (index, see htc_leo.c). */
 void leo_set_key(int key, bool down);

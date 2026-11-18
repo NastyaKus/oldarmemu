@@ -27,6 +27,7 @@
 #include "migration/vmstate.h"
 #include "qemu/main-loop.h"
 #include "qemu/rcu.h"
+#include "msm.h"
 #include "system/runstate.h"
 #include "adreno.h"
 
@@ -152,12 +153,22 @@ static void adreno_update_irq(AdrenoState *s)
     }
 }
 
+/* take the lock for a CPU access (or the IRQ bottom half); the GPU thread yields it between packets */
+static void adreno_mmio_lock(AdrenoState *s)
+{
+    if (qemu_mutex_trylock(&s->lock)) {
+        qatomic_inc(&s->mmio_waiting);
+        qemu_mutex_lock(&s->lock);
+        qatomic_dec(&s->mmio_waiting);
+    }
+}
+
 static void adreno_irq_bh(void *opaque)
 {
     AdrenoState *s = opaque;
     uint32_t sig;
 
-    qemu_mutex_lock(&s->lock);
+    adreno_mmio_lock(s);
     sig = adreno_irq_signal(s);
     qemu_mutex_unlock(&s->lock);
     qemu_set_irq(s->irq, sig != 0);
@@ -168,11 +179,20 @@ static void adreno_irq_bh(void *opaque)
 /* GPU virtual -> physical; false (and an MMU fault) when unmapped */
 static void adreno_tlb_flush(AdrenoState *s)
 {
-    s->tlb_valid = false;
-    memset(s->hp_tag, 0, sizeof(s->hp_tag));
+    s->mc_gen = s->mc_gen + 1 ? s->mc_gen + 1 : 1;
 }
 
-bool adreno_xlate(AdrenoState *s, uint32_t va, hwaddr *pa)
+/* drop a thread's cached translations made before the last flush */
+static inline void mc_sync(AdrenoState *s, AdrenoMemCache *c)
+{
+    if (unlikely(c->gen != s->mc_gen)) {
+        c->tlb_valid = false;
+        memset(c->hp_tag, 0, sizeof(c->hp_tag));
+        c->gen = s->mc_gen;
+    }
+}
+
+bool adreno_xlate_c(AdrenoState *s, AdrenoMemCache *c, uint32_t va, hwaddr *pa)
 {
     uint32_t cfg = s->regs[REG_MH_MMU_CONFIG];
     uint32_t range = s->regs[REG_MH_MMU_VA_RANGE];
@@ -184,7 +204,8 @@ bool adreno_xlate(AdrenoState *s, uint32_t va, hwaddr *pa)
         return true;
     }
     uint32_t idx = (va - base) >> 12;
-    if (idx != s->tlb_idx || !s->tlb_valid) {
+    mc_sync(s, c);
+    if (idx != c->tlb_idx || !c->tlb_valid) {
         uint32_t pte = ldl_le_phys(&address_space_memory,
                                    s->regs[REG_MH_MMU_PT_BASE] + idx * 4);
         if (!(pte & 3)) {
@@ -196,11 +217,11 @@ bool adreno_xlate(AdrenoState *s, uint32_t va, hwaddr *pa)
             s->regs[REG_MH_MMU_PAGE_FAULT] = va | 1;
             return false;
         }
-        s->tlb_idx = idx;
-        s->tlb_pte = pte;
-        s->tlb_valid = true;
+        c->tlb_idx = idx;
+        c->tlb_pte = pte;
+        c->tlb_valid = true;
     }
-    *pa = (s->tlb_pte & 0xfffff000) | (va & 0xfff);
+    *pa = (c->tlb_pte & 0xfffff000) | (va & 0xfff);
     return true;
 }
 
@@ -221,14 +242,14 @@ static void watch_check(AdrenoState *s, hwaddr pa, const uint8_t *p,
     }
 }
 
-uint8_t *adreno_host_page_slow(AdrenoState *s, uint32_t va)
+uint8_t *adreno_host_page_slow(AdrenoState *s, AdrenoMemCache *c, uint32_t va)
 {
     uint32_t pg = va >> 12, i = pg & (ADRENO_HP_ENTRIES - 1);
     hwaddr pa, xlat, len = 4096;
     MemoryRegion *mr;
     uint8_t *p = NULL;
 
-    if (!adreno_xlate(s, va & ~0xfffu, &pa)) {
+    if (!adreno_xlate_c(s, c, va & ~0xfffu, &pa)) {   /* also syncs c */
         return NULL;
     }
     RCU_READ_LOCK_GUARD();
@@ -236,8 +257,8 @@ uint8_t *adreno_host_page_slow(AdrenoState *s, uint32_t va)
                                  false, MEMTXATTRS_UNSPECIFIED);
     if (memory_region_is_ram(mr) && len >= 4096) {
         p = (uint8_t *)memory_region_get_ram_ptr(mr) + xlat;
-        s->hp_tag[i] = pg + 1;
-        s->hp_ptr[i] = p;
+        c->hp_tag[i] = pg + 1;
+        c->hp_ptr[i] = p;
     }
     return p;
 }
@@ -293,14 +314,15 @@ void adreno_wr32(AdrenoState *s, uint32_t va, uint32_t val)
 }
 
 /* Copy GPU memory, page by page. */
-void adreno_read(AdrenoState *s, uint32_t va, void *buf, uint32_t len)
+void adreno_read_c(AdrenoState *s, AdrenoMemCache *c, uint32_t va, void *buf,
+                   uint32_t len)
 {
     uint8_t *p = buf;
 
     while (len) {
         uint32_t n = MIN(len, 4096 - (va & 4095));
         hwaddr pa;
-        if (adreno_xlate(s, va, &pa)) {
+        if (adreno_xlate_c(s, c, va, &pa)) {
             address_space_read(&address_space_memory, pa,
                                MEMTXATTRS_UNSPECIFIED, p, n);
         } else {
@@ -312,7 +334,8 @@ void adreno_read(AdrenoState *s, uint32_t va, void *buf, uint32_t len)
     }
 }
 
-void adreno_write(AdrenoState *s, uint32_t va, const void *buf, uint32_t len)
+void adreno_write_c(AdrenoState *s, AdrenoMemCache *c, uint32_t va,
+                    const void *buf, uint32_t len)
 {
     const uint8_t *p = buf;
 
@@ -320,7 +343,7 @@ void adreno_write(AdrenoState *s, uint32_t va, const void *buf, uint32_t len)
     while (len) {
         uint32_t n = MIN(len, 4096 - (va & 4095));
         hwaddr pa;
-        if (adreno_xlate(s, va, &pa)) {
+        if (adreno_xlate_c(s, c, va, &pa)) {
             address_space_write(&address_space_memory, pa,
                                 MEMTXATTRS_UNSPECIFIED, p, n);
             watch_check(s, pa, p, n, "write");
@@ -328,6 +351,23 @@ void adreno_write(AdrenoState *s, uint32_t va, const void *buf, uint32_t len)
         va += n;
         p += n;
         len -= n;
+    }
+}
+
+/* debug: a draw rendered straight into memory [va, va+len) */
+void adreno_watch_draw(AdrenoState *s, uint32_t va, uint32_t len, const char *what)
+{
+    if (!adreno_watch || !len) {
+        return;
+    }
+    for (uint32_t off = 0; off < len + (va & 4095); off += 4096) {
+        hwaddr pa;
+        uint32_t v = (va & ~4095u) + off;
+        if (adreno_xlate(s, v, &pa) && (pa >> 12) == (adreno_watch >> 12)) {
+            qemu_log("adreno: watch %s: sysmem draw %" PRIu64 " va %08x-%08x hits"
+                     " the watched page (va %08x)\n", what, s->draws, va, va + len, v);
+            return;
+        }
     }
 }
 
@@ -666,6 +706,22 @@ static void cp_type3(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n,
     }
 }
 
+/*
+ * Between packets: let a waiting CPU register access in.  Without this an
+ * IRQ handler reading the status blocks for the GPU's whole next batch,
+ * and the guest CPU and the GPU end up taking turns instead of overlapping.
+ */
+static void cp_yield(AdrenoState *s)
+{
+    if (qatomic_read(&s->mmio_waiting)) {
+        qemu_mutex_unlock(&s->lock);
+        for (int i = 0; qatomic_read(&s->mmio_waiting) && i < 1000; i++) {
+            sched_yield();
+        }
+        qemu_mutex_lock(&s->lock);
+    }
+}
+
 static void cp_exec(AdrenoState *s, const uint32_t *cmd, uint32_t n, int level)
 {
     uint32_t i = 0;
@@ -707,6 +763,7 @@ static void cp_exec(AdrenoState *s, const uint32_t *cmd, uint32_t n, int level)
             cp_type3(s, op, &cmd[i], cnt, level, &skip);
             i += cnt;
             i += skip;
+            cp_yield(s);
             break;
         }
         }
@@ -785,6 +842,7 @@ static void cp_run(AdrenoState *s)
 
 static uint64_t adreno_mmio_read_locked(AdrenoState *s, uint32_t r);
 
+
 static uint64_t adreno_mmio_read(void *opaque, hwaddr off, unsigned size)
 {
     AdrenoState *s = opaque;
@@ -802,7 +860,7 @@ static uint64_t adreno_mmio_read(void *opaque, hwaddr off, unsigned size)
         /* polled: never wait; acquire pairs with the GPU thread's release */
         return qatomic_load_acquire(&s->regs[r]);
     }
-    qemu_mutex_lock(&s->lock);
+    adreno_mmio_lock(s);
     v = adreno_mmio_read_locked(s, r);
     qemu_mutex_unlock(&s->lock);
     return v;
@@ -850,7 +908,7 @@ static void adreno_mmio_write(void *opaque, hwaddr off, uint64_t val,
         qemu_event_set(&s->kick);
         return;
     }
-    qemu_mutex_lock(&s->lock);
+    adreno_mmio_lock(s);
     adreno_mmio_write_locked(s, r, val);
     qemu_mutex_unlock(&s->lock);
 }
@@ -932,6 +990,7 @@ static void *adreno_thread(void *opaque)
     AdrenoState *s = opaque;
 
     rcu_register_thread();
+    leo_thread_is_gpu();
     for (;;) {
         qemu_event_reset(&s->kick);
         if (qatomic_read(&s->quit)) {
@@ -939,7 +998,10 @@ static void *adreno_thread(void *opaque)
         }
         qemu_mutex_lock(&s->lock);
         if (!s->paused) {
+            s->in_run = true;
             cp_run(s);
+            s->in_run = false;
+            qemu_cond_broadcast(&s->run_done);
         }
         bool idle = s->paused ||
                     qatomic_read(&s->regs[REG_CP_RB_RPTR]) ==
@@ -982,6 +1044,10 @@ static void adreno_vm_state(void *opaque, bool running, RunState state)
 
     qemu_mutex_lock(&s->lock);
     s->paused = !running;
+    /* stopping (snapshots): let a ring pass that yielded finish first */
+    while (!running && s->in_run) {
+        qemu_cond_wait(&s->run_done, &s->lock);
+    }
     qemu_mutex_unlock(&s->lock);
     if (running) {
         qemu_event_set(&s->kick);
@@ -1028,7 +1094,9 @@ static void adreno_realize(DeviceState *dev, Error **errp)
     AdrenoState *s = ADRENO(dev);
 
     qemu_mutex_init(&s->lock);
+    qemu_cond_init(&s->run_done);
     qemu_event_init(&s->kick, false);
+    s->mc_gen = 1;
     s->irq_bh = qemu_bh_new(adreno_irq_bh, s);
     s->paused = !runstate_is_running();
     qemu_add_vm_change_state_handler(adreno_vm_state, s);
