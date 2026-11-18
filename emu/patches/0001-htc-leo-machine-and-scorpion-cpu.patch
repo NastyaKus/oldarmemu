@@ -1,3 +1,80 @@
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index 713bdb2..b2c63da 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -44,6 +44,7 @@
+ #include "tb-hash.h"
+ #include "tb-context.h"
+ #include "tb-internal.h"
++#include "accel/tcg/leojit-hooks.h"
+ #include "internal-common.h"
+ 
+ /* -icount align implementation. */
+@@ -944,6 +945,14 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+                 break;
+             }
+ 
++            /* oldarmemu: our own engine runs what it can, TCG the rest */
++            if (leo_jit_enabled && leo_jit_enabled() &&
++                !(s.cflags & (CF_COUNT_MASK | CF_NOIRQ | CF_SINGLE_STEP)) &&
++                !cpu->singlestep_enabled && leo_jit_exec(cpu, &s)) {
++                last_tb = NULL;
++                continue;
++            }
++
+             tb = tb_lookup(cpu, s);
+             if (tb == NULL) {
+                 CPUJumpCache *jc;
+@@ -980,6 +989,9 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+             }
+ 
+             cpu_loop_exec_tb(cpu, tb, s.pc, &last_tb, &tb_exit);
++            if (leo_jit_after_tb) {
++                leo_jit_after_tb(cpu);
++            }
+ 
+             /* Try to align the host and virtual clocks
+                if the guest is in advance */
+diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
+index e6d45c9..72f02e5 100644
+--- a/accel/tcg/tb-maint.c
++++ b/accel/tcg/tb-maint.c
+@@ -28,6 +28,7 @@
+ #include "exec/target_page.h"
+ #include "accel/tcg/cpu-ops.h"
+ #include "tb-internal.h"
++#include "accel/tcg/leojit-hooks.h"
+ #include "system/tcg.h"
+ #include "tcg/tcg.h"
+ #include "tb-hash.h"
+@@ -1180,6 +1181,17 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
+     struct page_collection *pages;
+     tb_page_addr_t index, index_last;
+ 
++    if (leo_jit_invalidate) {
++        /* oldarmemu leojit blocks; drop the write trap where nothing is left */
++        for (index = start >> TARGET_PAGE_BITS; index <= last >> TARGET_PAGE_BITS;
++             index++) {
++            tb_page_addr_t ps = index << TARGET_PAGE_BITS;
++            if (leo_jit_invalidate(MAX(ps, start), MIN(ps | ~TARGET_PAGE_MASK, last)) &&
++                !page_find(index)) {
++                tlb_unprotect_code(ps);
++            }
++        }
++    }
+     pages = page_collection_lock(start, last);
+ 
+     index_last = last >> TARGET_PAGE_BITS;
+@@ -1210,6 +1222,9 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
+ {
+     PageDesc *p = page_find(start >> TARGET_PAGE_BITS);
+ 
++    if (leo_jit_invalidate && leo_jit_invalidate(start, start + len - 1) && !p) {
++        tlb_unprotect_code(start & TARGET_PAGE_MASK);
++    }
+     if (p) {
+         ram_addr_t last = start + len - 1;
+         struct page_collection *pages = page_collection_lock(start, last);
 diff --git a/configs/devices/arm-softmmu/default.mak b/configs/devices/arm-softmmu/default.mak
 index 57ef1b8..756d573 100644
 --- a/configs/devices/arm-softmmu/default.mak
@@ -143,6 +220,29 @@ index 8c29059..af76fbc 100644
      }
  }
  
+diff --git a/include/accel/tcg/leojit-hooks.h b/include/accel/tcg/leojit-hooks.h
+new file mode 100644
+index 0000000..2462868
+--- /dev/null
++++ b/include/accel/tcg/leojit-hooks.h
+@@ -0,0 +1,17 @@
++/*
++ * Hooks into the oldarmemu leojit engine (target/arm/leojit), weak so
++ * that targets without it link unchanged.
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef ACCEL_TCG_LEOJIT_HOOKS_H
++#define ACCEL_TCG_LEOJIT_HOOKS_H
++
++#include "accel/tcg/tb-cpu-state.h"
++
++bool leo_jit_enabled(void) __attribute__((weak));
++bool leo_jit_exec(CPUState *cs, TCGTBCPUState *s) __attribute__((weak));
++bool leo_jit_invalidate(ram_addr_t start, ram_addr_t last) __attribute__((weak));
++void leo_jit_after_tb(CPUState *cs) __attribute__((weak));
++
++#endif
 diff --git a/include/hw/arm/boot.h b/include/hw/arm/boot.h
 index a2e22bd..351d2df 100644
 --- a/include/hw/arm/boot.h
@@ -175,6 +275,18 @@ index 518c0c1..b070d74 100644
      raw_write(env, ri, value);
      tlb_flush(CPU(cpu)); /* Flush TLB as domain not tracked in TLB */
  }
+diff --git a/target/arm/meson.build b/target/arm/meson.build
+index 07d9271..cbd495b 100644
+--- a/target/arm/meson.build
++++ b/target/arm/meson.build
+@@ -49,6 +49,7 @@ subdir('hvf')
+ 
+ if 'CONFIG_TCG' in config_all_accel
+    subdir('tcg')
++   subdir('leojit')
+ else
+     arm_common_system_ss.add(files('tcg-stubs.c'))
+ endif
 diff --git a/target/arm/tcg/cpu32.c b/target/arm/tcg/cpu32.c
 index a2a23ea..1b1e1a1 100644
 --- a/target/arm/tcg/cpu32.c

@@ -18,4 +18,5 @@ for p in "$ROOT"/emu/patches/*.patch; do
 done
 # live symlink so edits in emu/ are picked up without re-running this
 ln -sfn "$ROOT/emu/qemu-overlay/hw/arm/htcleo" hw/arm/htcleo
+ln -sfn "$ROOT/emu/qemu-overlay/target/arm/leojit" target/arm/leojit
 echo "QEMU prepared in $QEMU_SRC"
