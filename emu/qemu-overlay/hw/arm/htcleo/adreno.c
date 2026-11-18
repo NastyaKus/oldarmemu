@@ -297,6 +297,10 @@ void adreno_wr32(AdrenoState *s, uint32_t va, uint32_t val)
 {
     hwaddr pa;
 
+    if (adreno_gl_pending && qemu_thread_is_self(&s->thread)) {
+        adreno_gl_sync(s);              /* pixels before what announces them */
+    }
+
     if (adreno_xlate(s, va, &pa)) {
         /*
          * CP writes (timestamps, read pointer, scratch shadows) tell the
@@ -395,6 +399,10 @@ static void gpu_reg_write(AdrenoState *s, uint32_t reg, uint32_t val)
 {
     uint32_t idx;
     int t;
+
+    if (adreno_gl_pending && reg >= REG_SCRATCH_REG0 && reg < REG_SCRATCH_REG0 + 8) {
+        adreno_gl_sync(s);              /* KGSL timestamps */
+    }
 
     if (reg >= ADRENO_NREGS) {
         return;
@@ -824,7 +832,11 @@ static void cp_run(AdrenoState *s)
             }
             qemu_log("\n");
         }
+        adreno_gl_new_pass();
         cp_exec(s, buf, len, 0);
+        if (adreno_gl_pending) {
+            adreno_gl_sync(s);
+        }
         /* consumed: publish the read pointer once the work is done */
         qatomic_store_release(&s->regs[REG_CP_RB_RPTR], wptr);
         if (ringlog) {

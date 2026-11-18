@@ -25,6 +25,7 @@ class Settings(ctx: Context) {
     /* performance */
     var tbSize by int("tb_size", 256)                   // MiB of translated code
     var pinCpu by bool("pin_cpu", true)
+    var renderer by str("renderer", RENDER_GL)          // how Adreno 200 pixels are drawn
 
     /* network */
     var wifi by bool("wifi", true)                       // emulated BCM4329 + NAT
@@ -65,6 +66,8 @@ class Settings(ctx: Context) {
         const val SCALE_FIT = "fit"
         const val SCALE_FILL = "fill"
         const val SCALE_INTEGER = "integer"
+        const val RENDER_GL = "gl"                      // the phone's GPU (OpenGL ES 3)
+        const val RENDER_SW = "sw"                      // the emulator's software rasterizer
         const val THEME_SYSTEM = "system"
         const val THEME_LIGHT = "light"
         const val THEME_DARK = "dark"

@@ -120,6 +120,10 @@ uint8_t *adreno_host_page_slow(AdrenoState *s, AdrenoMemCache *c, uint32_t va);
 uint32_t adreno_rd32(AdrenoState *s, uint32_t va);
 void adreno_wr32(AdrenoState *s, uint32_t va, uint32_t val);
 void adreno_mark_dirty(AdrenoState *s, uint32_t va, uint32_t len);
+/* host GPU backend (adreno_gl.inc.c): pending resolves, flushed by the CP */
+extern int adreno_gl_pending;
+void adreno_gl_sync(AdrenoState *s);
+void adreno_gl_new_pass(void);
 void adreno_watch_draw(AdrenoState *s, uint32_t va, uint32_t len, const char *what);
 
 static inline bool adreno_xlate(AdrenoState *s, uint32_t va, hwaddr *pa)

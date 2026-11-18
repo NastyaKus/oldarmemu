@@ -85,6 +85,11 @@ fun SettingsScreen(
                     "zz-hd2emu-compat.zip пересобран. Прошейте его в recovery, чтобы применить."
                 else "Добавьте прошивку на SD-карту: zz-hd2emu-compat.zip появится с этой настройкой."
             }
+            ChoiceRow(Hd2Icons.Bolt, "Отрисовка Adreno",
+                listOf(Settings.RENDER_GL, Settings.RENDER_SW),
+                { if (it == Settings.RENDER_GL) "GPU телефона" else "Процессор" }, cfg.renderer,
+                "GPU телефона — быстрее; при сбое эмулятор сам перейдёт на процессор. " +
+                    "Применяется при следующем запуске") { cfg.renderer = it }
             ChoiceRow(Hd2Icons.Memory, "Кэш трансляции кода", Settings.TB_SIZES,
                 { "$it МБ" }, cfg.tbSize, "Больше — меньше перекомпиляций, но больше памяти") {
                 cfg.tbSize = it

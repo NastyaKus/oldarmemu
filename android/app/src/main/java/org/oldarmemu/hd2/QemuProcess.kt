@@ -77,6 +77,8 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
             .redirectErrorStream(true)
             .redirectOutput(File(st.dir, "qemu.log"))
         pb.environment()["TMPDIR"] = ctx.cacheDir.absolutePath
+        // Adreno 200 drawing: on the phone's GPU, or the software rasterizer
+        pb.environment()["ADRENO_BACKEND"] = cfg.renderer
         if (cfg.wifi) pb.environment()["SLIRP_RESOLV_CONF"] = writeResolvConf().absolutePath
         process = pb.start()
     }

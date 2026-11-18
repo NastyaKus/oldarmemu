@@ -2911,6 +2911,12 @@ static void raster_draw(DrawState *ds, uint32_t prim, PVtx **vs, uint32_t count)
 
 static DrawState last_slow = { .ps_base = UINT32_MAX };
 
+/* the host GPU backend, adreno_gl.inc.c (included at the end) */
+enum { GLB_OFF, GLB_ON, GLB_BOTH };
+static int gl_backend(void);
+static bool gl_draw(AdrenoState *s, DrawState *ds, uint32_t prim, PVtx **vs,
+                    uint32_t count);
+
 /*
  * GMEM area rendered since the last resolve.  A resolve copies only that
  * part: around a partial update GMEM holds whatever the previous pass
@@ -3053,8 +3059,14 @@ static void draw_one(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
         vs[i] = v;
     }
 
-    analyze_ps(s, &ds, prim, vs, count);
-    raster_draw(&ds, prim, vs, count);
+    int be = gl_backend();
+    if (!(be == GLB_ON && gl_draw(s, &ds, prim, vs, count))) {
+        analyze_ps(s, &ds, prim, vs, count);
+        raster_draw(&ds, prim, vs, count);
+        if (be == GLB_BOTH) {
+            gl_draw(s, &ds, prim, vs, count);
+        }
+    }
     if (adreno_trace && s->draws >= (uint64_t)adreno_trace_from &&
         s->draws < (uint64_t)adreno_trace_from + adreno_trace_len) {
         for (uint32_t i = 0; i < MIN(count, 4u); i++) {
@@ -3212,3 +3224,5 @@ void adreno_draw(AdrenoState *s, uint32_t op, const uint32_t *d, uint32_t n)
         t_start = t1;
     }
 }
+
+#include "adreno_gl.inc.c"
