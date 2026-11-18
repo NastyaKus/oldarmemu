@@ -219,12 +219,25 @@ static void addx(Asm *a, int rd, int rn, int64_t imm)
 /* ldr/str w at [x19 + off] */
 static void env_ldr(Asm *a, int rt, int off)
 {
+    g_assert(off >= 0 && off < 16384 && !(off & 3));
     I(a, 0xb9400000 | (off / 4) << 10 | X19 << 5 | rt);
 }
 
 static void env_str(Asm *a, int rt, int off)
 {
+    g_assert(off >= 0 && off < 16384 && !(off & 3));
     I(a, 0xb9000000 | (off / 4) << 10 | X19 << 5 | rt);
+}
+
+/* env->thumb is a bool in some QEMU versions: store it with its own size */
+static void env_str_thumb(Asm *a, int rt)
+{
+    int off = offsetof(CPUARMState, thumb);
+    if (sizeof(((CPUARMState *)0)->thumb) == 1) {
+        I(a, 0x39000000 | off << 10 | X19 << 5 | rt);      /* strb */
+    } else {
+        env_str(a, rt, off);
+    }
 }
 
 static void mrs_nzcv(Asm *a, int rt)
@@ -401,6 +414,7 @@ typedef struct Comp {
     int lastuse[LR_NREGS];
     bool busy[32];
     uint32_t insn_pc, condexec;
+    bool pc_written;                        /* this insn already set env's PC */
     Fix fix[256];
     int nfix;
     uint32_t *label_at[256];
@@ -465,12 +479,18 @@ static uint32_t live_temps(Comp *c)
     return m;
 }
 
-/* store PC/condexec of the current insn and all guest state to env */
+/*
+ * store PC/condexec of the current insn and all guest state to env; the
+ * PC is left alone once the insn has written its new value (the call is
+ * then e.g. the CPSR write of an exception return)
+ */
 static void sync_for_call(Comp *c, uint32_t pc, uint32_t condexec)
 {
     Asm *a = &c->a;
-    movw32(a, X16, pc);
-    env_str(a, X16, offsetof(CPUARMState, regs[15]));
+    if (!c->pc_written) {
+        movw32(a, X16, pc);
+        env_str(a, X16, offsetof(CPUARMState, regs[15]));
+    }
     movw32(a, X16, condexec);
     env_str(a, X16, offsetof(CPUARMState, condexec_bits));
     bl_to(a, tramp_sync_out);
@@ -721,10 +741,55 @@ static void gen_call(Comp *c, const LOp *o)
     mov32(a, hreg(c, o->d), X15);
 }
 
+/*
+ * Indirect exit of a block without helper calls (the mode cannot have
+ * changed): look the new PC up in leo_jc and jump straight there.
+ */
+static void gen_jc_lookup(Comp *c)
+{
+    Asm *a = &c->a;
+    LBlock *b = c->b;
+    uint32_t *miss[5];
+
+    env_ldr(a, X16, offsetof(CPUARMState, condexec_bits));
+    miss[4] = cbz_here(a, true, X16);                   /* inside an IT block */
+    env_ldr(a, X16, offsetof(CPUARMState, regs[15]));
+    if (sizeof(((CPUARMState *)0)->thumb) == 1) {
+        I(a, 0x39400000 | offsetof(CPUARMState, thumb) << 10 | X19 << 5 | X17);
+    } else {
+        env_ldr(a, X17, offsetof(CPUARMState, thumb));
+    }
+    dp3(a, A_ORR, X16, X16, X17);                       /* key */
+    ubfm(a, X17, X16, 1, LEO_JC_BITS);                  /* index */
+    movx64(a, X15, (uintptr_t)leo_jc);
+    I(a, 0x8b001400 | X17 << 16 | X15 << 5 | X15);      /* add x15, x15, x17, lsl 5 */
+    I(a, 0xb9400000 | X15 << 5 | X17);                  /* ldr w17, [x15] */
+    dp3(a, A_EOR, X17, X17, X16);
+    miss[0] = cbz_here(a, true, X17);
+    I(a, 0xb9400400 | X15 << 5 | X17);                  /* ldr w17, [x15, #4] */
+    movw32(a, X16, b->flags & LEO_FLAGS_MASK);
+    dp3(a, A_EOR, X17, X17, X16);
+    miss[1] = cbz_here(a, true, X17);
+    I(a, 0xf9400400 | X15 << 5 | X17);                  /* ldr x17, [x15, #8] */
+    movx64(a, X16, b->cs_base);
+    I(a, 0xca000000 | X16 << 16 | X17 << 5 | X17);      /* eor x17, x17, x16 */
+    miss[2] = cbz_here(a, true, X17);
+    I(a, 0xf9400800 | X15 << 5 | X15);                  /* ldr x15, [x15, #16] */
+    miss[3] = a->p;
+    I(a, 0xb4000000 | X15);                             /* cbz x15, miss */
+    I(a, 0xd61f0000 | X15 << 5);                        /* br x15 */
+    for (int i = 0; i < 5; i++) {
+        set_bc(miss[i], a->p);
+    }
+}
+
 /* leave: PC (and thumb, condexec) are in env already */
 static void gen_exit_op(Comp *c, bool chain, uint32_t pc)
 {
     Asm *a = &c->a;
+    if (!chain && !c->b->impure) {
+        gen_jc_lookup(c);
+    }
     if (c->nexit == ARRAY_SIZE(c->exits)) {
         c->fail = true;
         return;
@@ -756,6 +821,7 @@ static void compile_body(Comp *c)
         case L_INSN:
             c->insn_pc = o->imm;
             c->condexec = o->b;
+            c->pc_written = false;
             break;
         case L_MOVI:
             movw32(a, hreg(c, o->d), o->imm);
@@ -900,24 +966,27 @@ static void compile_body(Comp *c)
             x = hreg(c, o->a);
             env_str(a, x, offsetof(CPUARMState, regs[15]));
             known_pc = -1;
+            c->pc_written = true;
             break;
         case L_SETPCI:
             movw32(a, X16, o->imm);
             env_str(a, X16, offsetof(CPUARMState, regs[15]));
             known_pc = 1;
             pc_val = o->imm;
+            c->pc_written = true;
             break;
         case L_BX:
             x = hreg(c, o->a);
             ANDI(a, X16, x, 1);
-            env_str(a, X16, offsetof(CPUARMState, thumb));
+            env_str_thumb(a, X16);
             ANDI(a, X16, x, 0xfffffffe);
             env_str(a, X16, offsetof(CPUARMState, regs[15]));
             known_pc = -1;
+            c->pc_written = true;
             break;
         case L_SETTHUMB:
             movw32(a, X16, o->imm);
-            env_str(a, X16, offsetof(CPUARMState, thumb));
+            env_str_thumb(a, X16);
             known_pc = -1;                      /* mode change: through the loop */
             break;
         case L_SETCOND:
@@ -981,6 +1050,7 @@ void *leo_backend_compile(LBlock *b)
         }
         set_bc(c->fix[i].at, c->label_at[c->fix[i].label]);
     }
+    c->pc_written = false;              /* memory faults report the insn's PC */
     for (int i = 0; i < c->nslow; i++) {
         gen_slow(c, &c->slow[i]);
     }
@@ -1073,7 +1143,11 @@ bool leo_backend_init(CPUARMState *env)
     gen_enter(&a);
     code_ptr = (uint8_t *)tramp_sync_in + 4096;
     __builtin___clear_cache((char *)code_buf, (char *)a.p);
-    info_report("leojit: AArch64 code generator ready");
+    info_report("leojit: AArch64 code generator ready (env: pc %zu NF %zu thumb %zu "
+                "condexec %zu aarch64 %zu, icount %d tlb %d)",
+                offsetof(CPUARMState, regs[15]), offsetof(CPUARMState, NF),
+                offsetof(CPUARMState, thumb), offsetof(CPUARMState, condexec_bits),
+                offsetof(CPUARMState, aarch64), off_icount, off_tlbf);
     return true;
 }
 

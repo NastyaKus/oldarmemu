@@ -26,6 +26,7 @@ class Settings(ctx: Context) {
     var tbSize by int("tb_size", 256)                   // MiB of translated code
     var pinCpu by bool("pin_cpu", true)
     var vcpuPrime by bool("vcpu_prime", false)          // guest CPU alone on the prime core
+    var ownCpu by bool("own_cpu", false)                // leojit instead of QEMU TCG (experimental)
     var renderer by str("renderer", RENDER_GL)          // how Adreno 200 pixels are drawn
 
     /* network */

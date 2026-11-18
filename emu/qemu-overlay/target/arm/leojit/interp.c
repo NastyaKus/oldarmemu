@@ -77,6 +77,7 @@ static uint32_t h_cp_write(CPUARMState *env, uint32_t key, uint32_t val, uint32_
     } else {
         *(uint32_t *)((char *)env + ri->fieldoffset) = val;
     }
+    leo_jc_clear();                     /* translation regime may have changed */
     return 0;
 }
 

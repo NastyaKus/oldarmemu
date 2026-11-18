@@ -108,6 +108,21 @@ struct LBlock {
     GArray *incoming;                   /* LIncoming: exits patched to us */
 };
 
+/*
+ * Indirect branch cache, read by generated code: key = pc | thumb, flags
+ * and flags2 (cs_base) without the THUMB/CONDEXEC bits, and the code.
+ */
+typedef struct LJmp {
+    uint32_t key, flags;
+    uint64_t flags2;
+    void *code;
+    uint64_t pad;
+} LJmp;
+#define LEO_JC_BITS 12
+extern LJmp leo_jc[1 << LEO_JC_BITS];
+void leo_jc_clear(void);
+#define LEO_FLAGS_MASK (~(uint32_t)(R_TBFLAG_AM32_THUMB_MASK | R_TBFLAG_AM32_CONDEXEC_MASK))
+
 /* interp.c */
 void leo_interp(CPUARMState *env, LBlock *b);
 

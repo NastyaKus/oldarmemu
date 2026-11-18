@@ -36,7 +36,8 @@ static GHashTable *pages;               /* ram page -> first LBlock (pnext) */
 static LBlock *graveyard;               /* dead blocks, freed by the vCPU */
 static uint64_t st_blocks, st_insns, st_fallback, st_translated, st_inval;
 static uint64_t st_vok, st_vbad, st_vskip, st_vlost;
-static uint32_t st_lastpc, st_lastexit;
+static uint32_t st_lastpc, st_lastexit, st_ring[16], st_ringi;
+static uint64_t st_irqexit;
 
 static void leo_init(void)
 {
@@ -66,6 +67,33 @@ static unsigned hash_pc(vaddr pc, uint32_t flags)
 }
 
 static int backend = -1;                /* host code generator available */
+
+LJmp leo_jc[1 << LEO_JC_BITS] QEMU_ALIGNED(32);
+
+void leo_jc_clear(void)
+{
+    for (int i = 0; i < (1 << LEO_JC_BITS); i++) {
+        qatomic_set(&leo_jc[i].key, 0);
+        qatomic_set(&leo_jc[i].code, NULL);
+    }
+}
+
+static void jc_insert(LBlock *b)
+{
+    uint32_t key = (uint32_t)b->pc | FIELD_EX32(b->flags, TBFLAG_AM32, THUMB);
+    LJmp *j = &leo_jc[(key >> 1) & ((1 << LEO_JC_BITS) - 1)];
+
+    if (j->key == key && j->code == b->code) {
+        return;
+    }
+    qatomic_set(&j->key, 0);
+    smp_wmb();
+    j->flags = b->flags & LEO_FLAGS_MASK;
+    j->flags2 = b->cs_base;
+    qatomic_set(&j->code, b->code);
+    smp_wmb();
+    qatomic_set(&j->key, key);
+}
 
 static void free_block(LBlock *b)
 {
@@ -101,6 +129,9 @@ static void kill_block(LBlock *b)
         *pp = b->hnext;
     }
     unlink_incoming(b);
+    if (b->code) {
+        leo_jc_clear();
+    }
     b->dead = true;
     b->hnext = graveyard;
     graveyard = b;
@@ -136,6 +167,23 @@ bool leo_jit_invalidate(ram_addr_t start, ram_addr_t last)
     }
     qemu_mutex_unlock(&leo_lock);
     return had;
+}
+
+/* QEMU dropped all its code (e.g. a snapshot was loaded): drop ours too */
+void leo_jit_flush(void)
+{
+    if (leo_mode <= 0) {
+        return;
+    }
+    qemu_mutex_lock(&leo_lock);
+    for (int h = 0; h < (1 << HBITS); h++) {
+        while (htab[h]) {
+            kill_block(htab[h]);
+        }
+    }
+    g_hash_table_remove_all(pages);
+    leo_jc_clear();
+    qemu_mutex_unlock(&leo_lock);
 }
 
 static LBlock *lookup(CPUARMState *env, vaddr pc, uint64_t cs_base,
@@ -207,7 +255,18 @@ static void stats(void)
                     " lost %" PRIu64,
                     st_blocks, st_insns, st_fallback, st_translated, st_inval,
                     st_vok, st_vbad, st_vskip, st_vlost);
-        info_report("leojit: last block %08x, last exit record pc %08x", st_lastpc, st_lastexit);
+        info_report("leojit: last block %08x, last exit record pc %08x, %" PRIu64
+                    " exits with no record; recent: %08x %08x %08x %08x %08x %08x %08x %08x"
+                    " %08x %08x %08x %08x %08x %08x %08x %08x", st_lastpc, st_lastexit,
+                    st_irqexit, st_ring[(st_ringi + 0) & 15], st_ring[(st_ringi + 1) & 15],
+                    st_ring[(st_ringi + 2) & 15], st_ring[(st_ringi + 3) & 15],
+                    st_ring[(st_ringi + 4) & 15], st_ring[(st_ringi + 5) & 15],
+                    st_ring[(st_ringi + 6) & 15], st_ring[(st_ringi + 7) & 15],
+                    st_ring[(st_ringi + 8) & 15], st_ring[(st_ringi + 9) & 15],
+                    st_ring[(st_ringi + 10) & 15], st_ring[(st_ringi + 11) & 15],
+                    st_ring[(st_ringi + 12) & 15], st_ring[(st_ringi + 13) & 15],
+                    st_ring[(st_ringi + 14) & 15], st_ring[(st_ringi + 15) & 15]);
+        st_irqexit = 0;
         st_blocks = st_insns = st_fallback = st_translated = st_inval = 0;
     }
 }
@@ -395,6 +454,7 @@ static void flush_code(void)
             }
         }
     }
+    leo_jc_clear();
     leo_backend_reset();
     qemu_mutex_unlock(&leo_lock);
 }
@@ -602,8 +662,13 @@ bool leo_jit_exec(CPUState *cs, TCGTBCPUState *first)
             b->nojit = !b->code;
         }
         st_lastpc = b->pc;
+        st_ring[st_ringi++ & 15] = b->pc;
         if (b->code) {
+            jc_insert(b);
             LExitRec *x = (LExitRec *)leo_backend_run(env, b->code);
+            if (!x) {
+                st_irqexit++;
+            }
             if (x) {
                 st_lastexit = x->pc;
                 try_chain(cs, env, x);

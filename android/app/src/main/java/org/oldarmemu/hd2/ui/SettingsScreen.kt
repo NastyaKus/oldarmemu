@@ -100,6 +100,10 @@ fun SettingsScreen(
                 "Отдать ему одному ядро X3/Prime, остальное — на соседние. " +
                     "Сравните к/с: при нагреве ядро может сбавлять частоту",
                 cfg.vcpuPrime) { cfg.vcpuPrime = it }
+            SwitchRow(Hd2Icons.Memory, "Свой движок процессора (эксперимент)",
+                "Наш JIT ARMv7→ARM64 вместо QEMU TCG. Пока проверен на GB; " +
+                    "то, что он не умеет (VFP/NEON), исполняет QEMU. Применяется при следующем запуске",
+                cfg.ownCpu) { cfg.ownCpu = it }
         }
 
         SectionHeader("Сеть")

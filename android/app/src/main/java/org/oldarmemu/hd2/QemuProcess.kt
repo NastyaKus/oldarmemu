@@ -80,6 +80,11 @@ class QemuProcess(private val ctx: Context, private val st: Storage) {
         // Adreno 200 drawing: on the phone's GPU, or the software rasterizer
         pb.environment()["ADRENO_BACKEND"] = cfg.renderer
         if (cfg.pinCpu && cfg.vcpuPrime) pb.environment()["LEO_VCPU_PRIME"] = "1"
+        if (cfg.ownCpu) {
+            // our own ARMv7 engine; it reports its counters into qemu.log
+            pb.environment()["LEO_JIT"] = "1"
+            pb.environment()["LEO_JIT_STATS"] = "1"
+        }
         if (cfg.wifi) pb.environment()["SLIRP_RESOLV_CONF"] = writeResolvConf().absolutePath
         process = pb.start()
     }

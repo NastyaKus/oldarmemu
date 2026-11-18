@@ -36,7 +36,7 @@ index 713bdb2..b2c63da 100644
              /* Try to align the host and virtual clocks
                 if the guest is in advance */
 diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
-index e6d45c9..72f02e5 100644
+index e6d45c9..7439945 100644
 --- a/accel/tcg/tb-maint.c
 +++ b/accel/tcg/tb-maint.c
 @@ -28,6 +28,7 @@
@@ -47,7 +47,17 @@ index e6d45c9..72f02e5 100644
  #include "system/tcg.h"
  #include "tcg/tcg.h"
  #include "tb-hash.h"
-@@ -1180,6 +1181,17 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
+@@ -776,6 +777,9 @@ static void do_tb_flush(CPUState *cpu, run_on_cpu_data tb_flush_count)
+     tb_remove_all();
+ 
+     tcg_region_reset_all();
++    if (leo_jit_flush) {
++        leo_jit_flush();
++    }
+     /* XXX: flush processor icache at this point if cache flush is expensive */
+     qatomic_inc(&tb_ctx.tb_flush_count);
+ 
+@@ -1180,6 +1184,17 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
      struct page_collection *pages;
      tb_page_addr_t index, index_last;
  
@@ -65,7 +75,7 @@ index e6d45c9..72f02e5 100644
      pages = page_collection_lock(start, last);
  
      index_last = last >> TARGET_PAGE_BITS;
-@@ -1210,6 +1222,9 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
+@@ -1210,6 +1225,9 @@ void tb_invalidate_phys_range_fast(CPUState *cpu, ram_addr_t start,
  {
      PageDesc *p = page_find(start >> TARGET_PAGE_BITS);
  
@@ -222,10 +232,10 @@ index 8c29059..af76fbc 100644
  
 diff --git a/include/accel/tcg/leojit-hooks.h b/include/accel/tcg/leojit-hooks.h
 new file mode 100644
-index 0000000..2462868
+index 0000000..853f2fa
 --- /dev/null
 +++ b/include/accel/tcg/leojit-hooks.h
-@@ -0,0 +1,17 @@
+@@ -0,0 +1,18 @@
 +/*
 + * Hooks into the oldarmemu leojit engine (target/arm/leojit), weak so
 + * that targets without it link unchanged.
@@ -241,6 +251,7 @@ index 0000000..2462868
 +bool leo_jit_exec(CPUState *cs, TCGTBCPUState *s) __attribute__((weak));
 +bool leo_jit_invalidate(ram_addr_t start, ram_addr_t last) __attribute__((weak));
 +void leo_jit_after_tb(CPUState *cs) __attribute__((weak));
++void leo_jit_flush(void) __attribute__((weak));
 +
 +#endif
 diff --git a/include/hw/arm/boot.h b/include/hw/arm/boot.h
