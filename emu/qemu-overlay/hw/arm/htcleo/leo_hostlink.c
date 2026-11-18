@@ -200,6 +200,9 @@ static int leo_cpu_speeds(long *speed, int max_cpus, const char **how)
 #ifdef __linux__
 static cpu_set_t leo_fast_set;
 static bool leo_fast_valid;
+/* LEO_VCPU_PRIME=1: the guest CPU alone on the fastest core(s), the rest beside */
+static cpu_set_t leo_prime_set, leo_rest_set;
+static bool leo_prime_valid;
 
 /* the cgroup cpuset Android keeps this process in, and what it allows */
 static void leo_log_cpuset(const char *when)
@@ -274,6 +277,15 @@ void leo_pin_fast_cpus(void)
         }
     }
     leo_fast_set = set;
+    CPU_ZERO(&leo_prime_set);
+    for (int i = 0; i < n; i++) {
+        if (speed[i] * 100 >= max * 97) {
+            CPU_SET(i, &leo_prime_set);
+        }
+    }
+    CPU_XOR(&leo_rest_set, &set, &leo_prime_set);
+    leo_prime_valid = CPU_COUNT(&leo_rest_set) > 0 &&
+                      CPU_COUNT(&leo_prime_set) < CPU_COUNT(&set);
     leo_fast_valid = true;
     leo_log_cpuset("start");
     if (sched_setaffinity(0, sizeof(set), &set) < 0) {
@@ -364,6 +376,48 @@ static const char *leo_role(int tid)
     return "other";
 }
 
+/*
+ * Put the vCPU thread on the prime core(s) and every other emulator
+ * thread on the remaining fast cores, so nothing of ours competes with
+ * it there.  Redone periodically: new threads inherit the fast set and
+ * Android resets affinities when it moves the app between cpusets.
+ */
+static void leo_apply_prime(void)
+{
+    static int logged;
+    int vcpu = first_cpu ? first_cpu->thread_id : 0;
+    GDir *d;
+    const char *e;
+
+    if (!leo_prime_valid || vcpu <= 0 || !getenv("LEO_VCPU_PRIME") ||
+        strcmp(getenv("LEO_VCPU_PRIME"), "1")) {
+        return;
+    }
+    d = g_dir_open("/proc/self/task", 0, NULL);
+    if (!d) {
+        return;
+    }
+    int ok = sched_setaffinity(vcpu, sizeof(leo_prime_set), &leo_prime_set) == 0;
+    while ((e = g_dir_read_name(d))) {
+        int tid = atoi(e);
+        if (tid != vcpu) {
+            sched_setaffinity(tid, sizeof(leo_rest_set), &leo_rest_set);
+        }
+    }
+    g_dir_close(d);
+    if (!logged++) {
+        GString *g = g_string_new("");
+        for (int i = 0; i < CPU_SETSIZE; i++) {
+            if (CPU_ISSET(i, &leo_prime_set)) {
+                g_string_append_printf(g, " %d", i);
+            }
+        }
+        info_report("htc-leo: vCPU thread on prime CPU%s: %s", g->str,
+                    ok ? "ok" : strerror(errno));
+        g_string_free(g, true);
+    }
+}
+
 static void leo_boost_threads(void)
 {
     static bool done_cpu, done_gpu;
@@ -448,10 +502,14 @@ void leo_cpu_report(void)
     static int repins;
     if (off) {
         int n = leo_repin_threads();
+        leo_apply_prime();
         if (repins++ < 3) {
             leo_log_cpuset("emulator found on a slow core");
             info_report("htc-leo: re-pinned %d threads to the fast cores", n);
         }
+    }
+    if (now - last_log >= 10000) {
+        leo_apply_prime();
     }
     if (last && best_tid && now - last_log >= 10000) {
         long per = sysconf(_SC_CLK_TCK) * (now - last) / 1000 + 1;

@@ -96,6 +96,10 @@ fun SettingsScreen(
             }
             SwitchRow(Hd2Icons.Bolt, "Большие ядра процессора",
                 "Держать эмулятор на самых быстрых ядрах", cfg.pinCpu) { cfg.pinCpu = it }
+            SwitchRow(null, "Процессор HD2 на самом быстром ядре",
+                "Отдать ему одному ядро X3/Prime, остальное — на соседние. " +
+                    "Сравните к/с: при нагреве ядро может сбавлять частоту",
+                cfg.vcpuPrime) { cfg.vcpuPrime = it }
         }
 
         SectionHeader("Сеть")

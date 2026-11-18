@@ -25,6 +25,7 @@ class Settings(ctx: Context) {
     /* performance */
     var tbSize by int("tb_size", 256)                   // MiB of translated code
     var pinCpu by bool("pin_cpu", true)
+    var vcpuPrime by bool("vcpu_prime", false)          // guest CPU alone on the prime core
     var renderer by str("renderer", RENDER_GL)          // how Adreno 200 pixels are drawn
 
     /* network */
