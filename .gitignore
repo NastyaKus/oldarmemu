@@ -11,3 +11,4 @@ android/app/*.keystore
 android/local.properties
 android/app/src/main/assets/qemu/
 __pycache__/
+*.apk
