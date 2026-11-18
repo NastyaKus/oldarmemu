@@ -35,6 +35,28 @@ index 713bdb2..b2c63da 100644
  
              /* Try to align the host and virtual clocks
                 if the guest is in advance */
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index b063a57..d2739a6 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -28,6 +28,7 @@
+ #include "accel/tcg/cpu-ldst-common.h"
+ #include "accel/tcg/cpu-mmu-index.h"
+ #include "exec/cputlb.h"
++#include "accel/tcg/leojit-hooks.h"
+ #include "exec/tb-flush.h"
+ #include "system/ram_addr.h"
+ #include "exec/mmu-access-type.h"
+@@ -161,6 +162,9 @@ static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
+     for (i = 0; i < TB_JMP_PAGE_SIZE; i++) {
+         qatomic_set(&jc->array[i0 + i].tb, NULL);
+     }
++    if (leo_jit_flush_jc_page) {
++        leo_jit_flush_jc_page(page_addr);
++    }
+ }
+ 
+ /**
 diff --git a/accel/tcg/tb-maint.c b/accel/tcg/tb-maint.c
 index e6d45c9..7439945 100644
 --- a/accel/tcg/tb-maint.c
@@ -85,6 +107,26 @@ index e6d45c9..7439945 100644
      if (p) {
          ram_addr_t last = start + len - 1;
          struct page_collection *pages = page_collection_lock(start, last);
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index d468667..deac812 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -37,6 +37,7 @@
+ #include "internal-common.h"
+ #include "tcg/perf.h"
+ #include "tcg/insn-start-words.h"
++#include "accel/tcg/leojit-hooks.h"
+ 
+ TBContext tb_ctx;
+ 
+@@ -630,4 +631,7 @@ void tcg_flush_jmp_cache(CPUState *cpu)
+     for (int i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+         qatomic_set(&jc->array[i].tb, NULL);
+     }
++    if (leo_jit_flush_jc) {
++        leo_jit_flush_jc();
++    }
+ }
 diff --git a/configs/devices/arm-softmmu/default.mak b/configs/devices/arm-softmmu/default.mak
 index 57ef1b8..756d573 100644
 --- a/configs/devices/arm-softmmu/default.mak
@@ -232,10 +274,10 @@ index 8c29059..af76fbc 100644
  
 diff --git a/include/accel/tcg/leojit-hooks.h b/include/accel/tcg/leojit-hooks.h
 new file mode 100644
-index 0000000..853f2fa
+index 0000000..f393f25
 --- /dev/null
 +++ b/include/accel/tcg/leojit-hooks.h
-@@ -0,0 +1,18 @@
+@@ -0,0 +1,21 @@
 +/*
 + * Hooks into the oldarmemu leojit engine (target/arm/leojit), weak so
 + * that targets without it link unchanged.
@@ -252,6 +294,9 @@ index 0000000..853f2fa
 +bool leo_jit_invalidate(ram_addr_t start, ram_addr_t last) __attribute__((weak));
 +void leo_jit_after_tb(CPUState *cs) __attribute__((weak));
 +void leo_jit_flush(void) __attribute__((weak));
++/* QEMU dropped its virtual-PC jump cache: virtual mappings changed */
++void leo_jit_flush_jc(void) __attribute__((weak));
++void leo_jit_flush_jc_page(vaddr page) __attribute__((weak));
 +
 +#endif
 diff --git a/include/hw/arm/boot.h b/include/hw/arm/boot.h

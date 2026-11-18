@@ -102,6 +102,7 @@ struct LBlock {
     bool impure;                        /* calls with side effects: not replayable */
     uint32_t nverified;
     void *code;                         /* host code, when compiled */
+    void *code_end;
     bool nojit;                         /* the back end could not compile it */
     LExitRec *exits;
     int nexits;

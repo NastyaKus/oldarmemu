@@ -15,5 +15,7 @@ bool leo_jit_exec(CPUState *cs, TCGTBCPUState *s);
 bool leo_jit_invalidate(ram_addr_t start, ram_addr_t last);
 void leo_jit_after_tb(CPUState *cs);
 void leo_jit_flush(void);
+void leo_jit_flush_jc(void);
+void leo_jit_flush_jc_page(vaddr page);
 
 #endif

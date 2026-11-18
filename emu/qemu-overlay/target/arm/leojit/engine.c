@@ -25,6 +25,11 @@
 #include "leojit.h"
 #include "lir.h"
 #include "leojit-backend.h"
+#include <signal.h>
+#include <dlfcn.h>
+#ifdef __aarch64__
+#include <ucontext.h>
+#endif
 
 #define HBITS       16
 #define MAX_INSNS   64
@@ -35,9 +40,141 @@ static LBlock *htab[1 << HBITS];
 static GHashTable *pages;               /* ram page -> first LBlock (pnext) */
 static LBlock *graveyard;               /* dead blocks, freed by the vCPU */
 static uint64_t st_blocks, st_insns, st_fallback, st_translated, st_inval;
-static uint64_t st_vok, st_vbad, st_vskip, st_vlost;
+static uint64_t st_vok, st_vbad, st_vskip, st_vlost, st_compiled, st_nojit, st_interp;
 static uint32_t st_lastpc, st_lastexit, st_ring[16], st_ringi;
 static uint64_t st_irqexit;
+
+/*
+ * A host crash with leojit on: say where (our code or QEMU's, which
+ * guest block), then let the default handler finish the process.
+ */
+static struct sigaction old_segv, old_bus, old_ill;
+
+static LBlock *block_at(uintptr_t pc)
+{
+    for (int h = 0; h < (1 << HBITS); h++) {
+        for (LBlock *b = htab[h]; b; b = b->hnext) {
+            if (b->code && pc >= (uintptr_t)b->code && pc < (uintptr_t)b->code_end) {
+                return b;
+            }
+        }
+    }
+    for (LBlock *b = graveyard; b; b = b->hnext) {
+        if (b->code && pc >= (uintptr_t)b->code && pc < (uintptr_t)b->code_end) {
+            return b;
+        }
+    }
+    return NULL;
+}
+
+static void where(const char *what, uintptr_t pc)
+{
+    Dl_info di;
+
+    if (leo_backend_owns(pc)) {
+        LBlock *b = block_at(pc);
+        if (b) {
+            fprintf(stderr, "  %s %#lx: JIT block %08x+%#lx (%s%s, %u insns)\n", what,
+                    (unsigned long)pc, (uint32_t)b->pc,
+                    (unsigned long)(pc - (uintptr_t)b->code),
+                    FIELD_EX32(b->flags, TBFLAG_AM32, THUMB) ? "T32" : "A32",
+                    b->dead ? ", dead" : "", b->ninsn);
+        } else {
+            fprintf(stderr, "  %s %#lx: JIT buffer (trampoline or reused)\n", what,
+                    (unsigned long)pc);
+        }
+    } else if (dladdr((void *)pc, &di) && di.dli_fbase) {
+        fprintf(stderr, "  %s %#lx: %s+%#lx %s\n", what, (unsigned long)pc,
+                di.dli_fname ? strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1
+                                                         : di.dli_fname : "?",
+                (unsigned long)(pc - (uintptr_t)di.dli_fbase),
+                di.dli_sname ? di.dli_sname : "");
+    } else {
+        fprintf(stderr, "  %s %#lx\n", what, (unsigned long)pc);
+    }
+}
+
+static void crash_handler(int sig, siginfo_t *si, void *uc_)
+{
+    struct sigaction *old = sig == SIGSEGV ? &old_segv : sig == SIGBUS ? &old_bus : &old_ill;
+    CPUState *cs = current_cpu;
+
+    fprintf(stderr, "leojit: CRASH signal %d code %d at address %p\n",
+            sig, si->si_code, si->si_addr);
+#ifdef __aarch64__
+    {
+        ucontext_t *uc = uc_;
+        mcontext_t *m = &uc->uc_mcontext;
+        uintptr_t fp = m->regs[29], sp = m->sp;
+
+        where("pc", m->pc);
+        where("lr", m->regs[30]);
+        if (getenv("LEO_JIT_CRASHDUMP")) {
+            LBlock *b = block_at(m->regs[30]);
+            if (!b) {
+                b = block_at(m->pc);
+            }
+            if (b) {
+                fprintf(stderr, "  code %p:", b->code);
+                for (uint32_t *p = b->code; p < (uint32_t *)b->code_end; p++) {
+                    fprintf(stderr, " %08x", *p);
+                }
+                fprintf(stderr, "\n  ir:");
+                for (uint32_t i = 0; i < b->nops; i++) {
+                    const LOp *o = &b->ops[i];
+                    fprintf(stderr, " [%u %u %u %u %u %x]", o->op, o->d, o->a, o->b, o->c, o->imm);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+        for (int i = 0; i < 31; i += 4) {
+            fprintf(stderr, "  x%-2d %016llx %016llx %016llx %016llx\n", i,
+                    (unsigned long long)m->regs[i],
+                    (unsigned long long)(i + 1 < 31 ? m->regs[i + 1] : sp),
+                    (unsigned long long)(i + 2 < 31 ? m->regs[i + 2] : 0),
+                    (unsigned long long)(i + 3 < 31 ? m->regs[i + 3] : 0));
+        }
+        /* frame records of the C code around (x29 may hold a guest value) */
+        for (int i = 0; i < 12 && fp > sp && fp - sp < (1 << 20) && !(fp & 7); i++) {
+            uintptr_t *fr = (uintptr_t *)fp;
+            where("frame", fr[1]);
+            if (fr[0] <= fp) {
+                break;
+            }
+            fp = fr[0];
+        }
+    }
+#endif
+    if (cs) {
+        CPUARMState *env = cpu_env(cs);
+        fprintf(stderr, "  guest pc %08x cpsr %08x thumb %d, last block %08x, last exit %08x\n",
+                env->regs[15], cpsr_read(env), env->thumb, st_lastpc, st_lastexit);
+        for (int i = 0; i < 16; i += 4) {
+            fprintf(stderr, "  r%-2d %08x %08x %08x %08x\n", i, env->regs[i],
+                    env->regs[i + 1], env->regs[i + 2], env->regs[i + 3]);
+        }
+    }
+    fprintf(stderr, "  recent:");
+    for (int i = 0; i < 16; i++) {
+        fprintf(stderr, " %08x", st_ring[(st_ringi + i) & 15]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    sigaction(sig, old, NULL);          /* re-fault into the previous handler */
+}
+
+static void install_crash_handler(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+    sigaction(SIGILL, &sa, &old_ill);
+}
 
 static void leo_init(void)
 {
@@ -49,6 +186,7 @@ static void leo_init(void)
         qemu_mutex_init(&leo_lock);
         pages = g_hash_table_new(g_direct_hash, g_direct_equal);
         info_report("leojit: %s", leo_mode == 2 ? "verifying against TCG" : "on");
+        install_crash_handler();
     }
 }
 
@@ -78,8 +216,37 @@ void leo_jc_clear(void)
     }
 }
 
+/* QEMU's own virtual-PC jump cache was dropped: drop ours the same way */
+void leo_jit_flush_jc(void)
+{
+    if (leo_mode > 0) {
+        leo_jc_clear();
+    }
+}
+
+void leo_jit_flush_jc_page(vaddr page)
+{
+    unsigned i0 = (page >> 1) & ((1 << LEO_JC_BITS) - 1) & ~2047u;
+
+    if (leo_mode <= 0) {
+        return;
+    }
+    for (unsigned i = 0; i < 2048; i++) {
+        LJmp *j = &leo_jc[(i0 + i) & ((1 << LEO_JC_BITS) - 1)];
+        qatomic_set(&j->key, 0);
+        qatomic_set(&j->code, NULL);
+    }
+}
+
 static void jc_insert(LBlock *b)
 {
+    static int nojc = -1;
+    if (nojc < 0) {
+        nojc = getenv("LEO_JIT_NOJC") != NULL;
+    }
+    if (nojc) {
+        return;
+    }
     uint32_t key = (uint32_t)b->pc | FIELD_EX32(b->flags, TBFLAG_AM32, THUMB);
     LJmp *j = &leo_jc[(key >> 1) & ((1 << LEO_JC_BITS) - 1)];
 
@@ -91,8 +258,21 @@ static void jc_insert(LBlock *b)
     j->flags = b->flags & LEO_FLAGS_MASK;
     j->flags2 = b->cs_base;
     qatomic_set(&j->code, b->code);
-    smp_wmb();
+    smp_mb();
+    /*
+     * Another thread may have killed b (and cleared the cache) since the
+     * lookup: publish only a live block, then check again.
+     */
+    if (qatomic_read(&b->dead)) {
+        qatomic_set(&j->code, NULL);
+        return;
+    }
     qatomic_set(&j->key, key);
+    smp_mb();
+    if (qatomic_read(&b->dead)) {
+        qatomic_set(&j->key, 0);
+        qatomic_set(&j->code, NULL);
+    }
 }
 
 static void free_block(LBlock *b)
@@ -128,11 +308,12 @@ static void kill_block(LBlock *b)
     if (*pp) {
         *pp = b->hnext;
     }
+    qatomic_set(&b->dead, true);
+    smp_mb();
     unlink_incoming(b);
     if (b->code) {
         leo_jc_clear();
     }
-    b->dead = true;
     b->hnext = graveyard;
     graveyard = b;
     st_inval++;
@@ -255,6 +436,9 @@ static void stats(void)
                     " lost %" PRIu64,
                     st_blocks, st_insns, st_fallback, st_translated, st_inval,
                     st_vok, st_vbad, st_vskip, st_vlost);
+        info_report("leojit: compiled %" PRIu64 ", not compilable %" PRIu64
+                    ", interpreted runs %" PRIu64, st_compiled, st_nojit, st_interp);
+        st_interp = 0;
         info_report("leojit: last block %08x, last exit record pc %08x, %" PRIu64
                     " exits with no record; recent: %08x %08x %08x %08x %08x %08x %08x %08x"
                     " %08x %08x %08x %08x %08x %08x %08x %08x", st_lastpc, st_lastexit,
@@ -465,7 +649,12 @@ static void try_chain(CPUState *cs, CPUARMState *env, LExitRec *x)
     LBlock *from = x->from, *t;
     TCGTBCPUState s;
 
-    if (!x->chain || from->dead || env->regs[15] != x->pc) {
+    static int nochain = -1;
+    if (nochain < 0) {
+        nochain = getenv("LEO_JIT_NOCHAIN") != NULL;
+    }
+    /* after CPSR writes and the like, QEMU must look at pending IRQs first */
+    if (nochain || from->impure || !x->chain || from->dead || env->regs[15] != x->pc) {
         return;
     }
     s = cs->cc->tcg_ops->get_tb_cpu_state(cs);
@@ -511,6 +700,7 @@ static bool jitcheck_one(CPUState *cs, LBlock *b)
             flush_code();
         }
         b->code = leo_backend_compile(b);
+        b->code_end = leo_backend_ptr();
         b->nojit = !b->code;
     }
     if (!b->code) {
@@ -659,7 +849,13 @@ bool leo_jit_exec(CPUState *cs, TCGTBCPUState *first)
                 flush_code();
             }
             b->code = leo_backend_compile(b);
+            b->code_end = leo_backend_ptr();
             b->nojit = !b->code;
+            if (b->code) {
+                st_compiled++;
+            } else {
+                st_nojit++;
+            }
         }
         st_lastpc = b->pc;
         st_ring[st_ringi++ & 15] = b->pc;
@@ -675,11 +871,16 @@ bool leo_jit_exec(CPUState *cs, TCGTBCPUState *first)
             }
         } else {
             leo_interp(env, b);
+            st_interp++;
         }
         st_blocks++;
         st_insns += b->ninsn;
         ran = true;
-        if ((int32_t)qatomic_read(&cs->neg.icount_decr.u32) < 0) {
+        /*
+         * As TCG ends a TB after CPSR writes: IRQs may just have been
+         * unmasked, and an IRQ already pending raises no new exit request.
+         */
+        if (b->impure || (int32_t)qatomic_read(&cs->neg.icount_decr.u32) < 0) {
             break;
         }
     }

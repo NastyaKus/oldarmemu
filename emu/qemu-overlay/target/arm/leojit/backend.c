@@ -417,7 +417,7 @@ typedef struct Comp {
     bool pc_written;                        /* this insn already set env's PC */
     Fix fix[256];
     int nfix;
-    uint32_t *label_at[256];
+    uint32_t **label_at;                    /* op index of an L_LABEL -> code */
     /* slow paths emitted after the body */
     struct Slow {
         uint32_t *jump, *resume;
@@ -815,7 +815,7 @@ static void compile_body(Comp *c)
         case L_NOP:
             break;
         case L_LABEL:
-            c->label_at[o->imm] = a->p;
+            c->label_at[i] = a->p;
             known_pc = -1;
             break;
         case L_INSN:
@@ -1032,6 +1032,7 @@ void *leo_backend_compile(LBlock *b)
         }
     }
     c->b = b;
+    c->label_at = g_new0(uint32_t *, b->nops + 1);
     c->a.start = c->a.p = (uint32_t *)code_ptr;
     c->a.end = (uint32_t *)code_end;
     Asm *a = &c->a;
@@ -1045,7 +1046,7 @@ void *leo_backend_compile(LBlock *b)
         goto out;
     }
     for (int i = 0; i < c->nfix; i++) {
-        if (!c->label_at[c->fix[i].label]) {
+        if (c->fix[i].label >= b->nops || !c->label_at[c->fix[i].label]) {
             goto out;
         }
         set_bc(c->fix[i].at, c->label_at[c->fix[i].label]);
@@ -1082,6 +1083,7 @@ void *leo_backend_compile(LBlock *b)
     code_ptr = (uint8_t *)QEMU_ALIGN_PTR_UP(a->p, 16);
     __builtin___clear_cache((char *)ret, (char *)a->p);
 out:
+    g_free(c->label_at);
     g_free(c);
     return ret;
 }
@@ -1089,6 +1091,17 @@ out:
 bool leo_backend_full(void)
 {
     return code_buf && code_end - code_ptr < (1 << 20);
+}
+
+/* end of the last compiled block */
+void *leo_backend_ptr(void)
+{
+    return code_ptr;
+}
+
+bool leo_backend_owns(uintptr_t pc)
+{
+    return code_buf && pc >= (uintptr_t)code_buf && pc < (uintptr_t)code_end;
 }
 
 void leo_backend_reset(void)
@@ -1179,6 +1192,16 @@ uintptr_t leo_backend_run(CPUARMState *env, void *code)
 
 void leo_backend_patch(uint32_t *site, void *target, uint32_t orig)
 {
+}
+
+void *leo_backend_ptr(void)
+{
+    return NULL;
+}
+
+bool leo_backend_owns(uintptr_t pc)
+{
+    return false;
 }
 
 #endif
